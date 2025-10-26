@@ -1,4 +1,4 @@
-// env.js (ESM)
+// env.js
 import dotenv from 'dotenv';
 dotenv.config();
 
@@ -12,13 +12,13 @@ export const config = {
   WHATSAPP_TOKEN: process.env.WHATSAPP_TOKEN,
   WHATSAPP_PHONE_ID: process.env.WHATSAPP_PHONE_ID,
 
-  // Catalog / Business
+  // Catálogo/negocio
   CATALOG_URL: process.env.CATALOG_URL,
   STORE_LAT: process.env.STORE_LAT ? Number(process.env.STORE_LAT) : undefined,
   STORE_LNG: process.env.STORE_LNG ? Number(process.env.STORE_LNG) : undefined,
   TIMEZONE: process.env.TIMEZONE || 'America/La_Paz',
 
-  // Optional AI
+  // IA (opcional)
   OPENAI_API_KEY: process.env.OPENAI_API_KEY,
 
   // Google Sheets (opcional)
@@ -31,6 +31,3 @@ export const config = {
 
   DEBUG_LOGS: process.env.DEBUG_LOGS === '1',
 };
-
-// opcional: también default para evitar problemas si importan por default
-export default { config };

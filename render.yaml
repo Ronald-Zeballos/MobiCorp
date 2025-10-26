@@ -4,10 +4,8 @@ services:
     env: node
     plan: free
     buildCommand: "npm install"
-    startCommand: "node server.mjs"   # <— CAMBIA AQUÍ
+    startCommand: "node server.js"
     envVars:
       - key: NODE_ENV
         value: production
-      - key: PORT
-        value: 10000
     healthCheckPath: /health
