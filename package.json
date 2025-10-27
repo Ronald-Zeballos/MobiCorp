@@ -3,7 +3,9 @@
   "version": "1.0.0",
   "description": "WhatsApp Cloud API bot (Mixed Flow: IA + Buttons) for Render.",
   "type": "module",
-  "engines": { "node": ">=18" },
+  "engines": {
+    "node": ">=18"
+  },
   "scripts": {
     "start": "node server.js",
     "dev": "NODE_ENV=development node server.js"
@@ -11,6 +13,8 @@
   "dependencies": {
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
+    "node-fetch": "^3.3.2",
+    "openai": "^6.7.0",
     "pdfkit": "^0.15.0"
   }
 }
