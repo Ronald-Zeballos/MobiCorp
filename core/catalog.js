@@ -32,7 +32,6 @@ export function loadCatalog() {
   return { products, bySlug };
 }
 
-/** Scoring simple para similitud */
 function scoreMatch(base, q) {
   if (base === q) return 100;
   if (base.includes(q)) return 80;
@@ -42,7 +41,6 @@ function scoreMatch(base, q) {
   return hits ? 40 + hits * 5 : 0;
 }
 
-/** Busca por texto y devuelve el mejor match o null */
 export function searchProductByText(catalog, text = '') {
   const q = slugify(text);
   if (!q) return null;
@@ -54,7 +52,6 @@ export function searchProductByText(catalog, text = '') {
   return bestScore > 0 ? best : null;
 }
 
-/** Devuelve el path de imagen por nombre (flex) o null */
 export function getImagePathForName(catalog, name = '') {
   const found = searchProductByText(catalog, name);
   return found ? found.file : null;

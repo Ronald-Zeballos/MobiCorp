@@ -5,7 +5,8 @@ import { loadSession, saveSession } from '../core/session.js';
 import { aiDecide } from '../core/ai.js';
 import {
   wantsCatalog, wantsHuman, wantsLocation, wantsClose, wantsPrice,
-  looksLikeFullName, detectDepartamento, detectSubzona, parseHectareas
+  looksLikeFullName, detectDepartamento, detectSubzona, parseHectareas,
+  DEPARTAMENTOS, SUBZONAS_SCZ
 } from '../core/intents.js';
 import {
   btnsDepartamento, btnsSubzonaSCZ, btnsCultivos,
@@ -17,7 +18,7 @@ import {
 import { parseCartFromText } from './parse.js';
 import { buildQuote } from '../src/quote.js';
 import { sheetsAppendFromSession } from '../src/sheets.js';
-import { loadCatalog, searchProductByText, getImagePathForName } from '../core/catalog.js';
+import { loadCatalog, searchProductByText } from '../core/catalog.js';
 
 const router = express.Router();
 const catalog = loadCatalog();
@@ -35,37 +36,36 @@ function seen(wamid) {
 
 // ------- Utils de orquestación (flujo abierto) -------
 function hasEnoughForQuote(s) {
-  const base = s.name && s.departamento && s.cultivo && (s.hectareas !== null && s.hectareas !== undefined) && s.campana;
+  // NO pedimos nombre aquí; se pide justo antes del PDF
+  const base = s.departamento && s.cultivo && (s.hectareas !== null && s.hectareas !== undefined) && s.campana;
   const subOk = (s.departamento === 'Santa Cruz') ? !!s.subzona : true;
   const cartOk = s.items && s.items.length > 0;
-  return (base && subOk) || (cartOk && s.name && s.departamento);
+  return (base && subOk) || (cartOk && s.departamento);
 }
 
+// Orden conversacional: producto → ha → campaña → dpto → subzona → (nombre al cerrar)
 function nextMissingSlot(s) {
-  if (!s.name) return 'name';
-  if (!s.departamento) return 'departamento';
-  if (s.departamento === 'Santa Cruz' && !s.subzona) return 'subzona';
   if (!s.cultivo) return 'cultivo';
   if (s.hectareas === null || s.hectareas === undefined) return 'hectareas';
   if (!s.campana) return 'campana';
-  return null;
+  if (!s.departamento) return 'departamento';
+  if (s.departamento === 'Santa Cruz' && !s.subzona) return 'subzona';
+  return null; // nombre al final
 }
 
 async function askForSlot(to, slot) {
   switch (slot) {
-    case 'name':
-      return waSendText(to, '¿Cómo te llamas? (Nombre y apellido)');
+    case 'cultivo':
+      return waSendButtons(to, '¿Para qué *cultivo* es? Elegí una opción:', btnsCultivos());
+    case 'hectareas':
+      await waSendButtons(to, '¿Cuántas *hectáreas* vas a trabajar?', btnsHectareas());
+      return waSendText(to, 'También podés escribir el número (por ejemplo: 120).');
+    case 'campana':
+      return waSendButtons(to, '¿Para qué *campaña*?', btnsCampana());
     case 'departamento':
-      return waSendButtons(to, 'Elegí tu *Departamento*:', btnsDepartamento());
+      return waSendButtons(to, '¿En qué *Departamento* estás?', btnsDepartamento());
     case 'subzona':
       return waSendButtons(to, 'Seleccioná tu *Subzona* en Santa Cruz:', btnsSubzonaSCZ());
-    case 'cultivo':
-      return waSendButtons(to, 'Seleccioná tu *Cultivo*:', btnsCultivos());
-    case 'hectareas':
-      await waSendButtons(to, '¿Cuántas *Hectáreas*?', btnsHectareas());
-      return waSendText(to, 'También podés escribir la cantidad (por ejemplo: 120).');
-    case 'campana':
-      return waSendButtons(to, '¿Para qué *Campaña*?', btnsCampana());
     default:
       return null;
   }
@@ -127,7 +127,6 @@ router.post('/webhook', async (req, res) => {
 
     const fromId = msg.from;
     const type = msg.type;
-    const profileName = value?.contacts?.[0]?.profile?.name;
 
     let s = loadSession(fromId);
     s.lastWamid = wamid;
@@ -140,10 +139,27 @@ router.post('/webhook', async (req, res) => {
         s.pausedUntil = 0;
         await waSendText(fromId, '🤖 ¡Aquí estoy de vuelta! Sigamos con tu cotización.');
       } else {
-        await waSendText(fromId, '🧑‍💼 Te derivé con un asesor. Escribí "continuar" para volver conmigo.');
+        await waSendText(fromId, '🧑‍💼 Estás con un asesor. Escribí "continuar" para volver conmigo.');
         saveSession(fromId, s);
         return res.sendStatus(200);
       }
+    }
+
+    // -------- SALUDO HUMANO (solo 1 vez) --------
+    if (!s.greeted) {
+      s.greeted = true;
+      await waSendText(
+        fromId,
+        '👋 ¡Bienvenido/a a *NewChem Agroquímicos*! Contame, ¿qué necesitás hoy?\n' +
+        'Podés escribirme el producto, pegar tu lista, o mandarme una foto con el nombre.'
+      );
+      await waSendButtons(fromId, 'Puedo ayudarte con:', [
+        { id: 'btn_quote', title: '🧾 Cotizar' },
+        { id: 'btn_catalog', title: 'Catálogo' },
+        { id: 'btn_human', title: 'Hablar con asesor' }
+      ]);
+      saveSession(fromId, s);
+      return res.sendStatus(200);
     }
 
     // Normalizar entrada
@@ -158,29 +174,71 @@ router.post('/webhook', async (req, res) => {
       s.userLocation = { lat: msg.location?.latitude, lng: msg.location?.longitude };
       await waSendText(fromId, '📍 ¡Gracias! Guardé tu ubicación para la cotización.');
     }
+    if (config.DEBUG_LOGS) console.log('[IN <-]', type, incomingText);
 
-    // (NUEVO) Imagen: intentar reconocer por caption contra catálogo
+    // -------- Botones de bienvenida --------
+    if (incomingText === 'btn_catalog') {
+      await waSendText(fromId, `🛒 Catálogo: ${config.CATALOG_URL || 'No disponible'}`);
+      await waSendText(fromId, 'Decime qué producto te interesa y te lo cotizo 😉');
+      saveSession(fromId, s); return res.sendStatus(200);
+    }
+    if (incomingText === 'btn_human') {
+      s.pausedUntil = Date.now() + 4 * 60 * 60 * 1000;
+      await waSendText(fromId, '🧑‍💼 Te conecto con un asesor. Para volver conmigo, escribí *continuar*.');
+      saveSession(fromId, s); return res.sendStatus(200);
+    }
+    if (incomingText === 'btn_quote') {
+      const missing = nextMissingSlot(s) || 'cultivo';
+      await waSendText(fromId, '¡Perfecto! Armemos tu cotización rápido 😊');
+      await askForSlot(fromId, missing);
+      saveSession(fromId, s); return res.sendStatus(200);
+    }
+
+    // -------- Manejo explícito de botones dep_/sub_ --------
+    if (incomingText?.startsWith?.('dep_')) {
+      const idx = Number(incomingText.split('_')[1]);
+      const dep = DEPARTAMENTOS[idx];
+      if (dep) {
+        s.departamento = dep;
+        if (dep === 'Santa Cruz') {
+          await waSendButtons(fromId, 'Seleccioná tu *Subzona* en Santa Cruz:', btnsSubzonaSCZ());
+        } else {
+          await waSendButtons(fromId, 'Genial. ¿Para qué *Cultivo* es?', btnsCultivos());
+          s.stage = 'product';
+        }
+        saveSession(fromId, s);
+        return res.sendStatus(200);
+      }
+    }
+    if (incomingText?.startsWith?.('sub_')) {
+      const idx = Number(incomingText.split('_')[1]);
+      const sub = SUBZONAS_SCZ[idx];
+      if (sub) {
+        s.subzona = sub;
+        await waSendButtons(fromId, 'Perfecto. ¿Qué *Cultivo* vas a trabajar?', btnsCultivos());
+        s.stage = 'product';
+        saveSession(fromId, s);
+        return res.sendStatus(200);
+      }
+    }
+
+    // -------- Imagen: reconocer por caption contra catálogo --------
     if (type === 'image') {
       const caption = msg.image?.caption || '';
       if (caption) {
         const found = searchProductByText(catalog, caption);
         if (found) {
           s.items.push({ name: found.name, qty: 1, price: null });
-          await waSendText(fromId, `🖼️ Perfecto, identifiqué *${found.name}*. Lo agrego a tu cotización.`);
-          // opcional: reenviar la misma imagen de nuestro catálogo para confirmar
-          const mediaId = await waUploadMediaFromFile(found.file, 'image/jpeg', `${found.name}.jpg`);
-          if (mediaId) await waSendImage(fromId, mediaId, `Confirmación: ${found.name}`);
+          await waSendText(fromId, `🖼️ Identifiqué *${found.name}*. Lo agrego a tu cotización.`);
         } else {
-          await waSendText(fromId, 'Recibí la imagen. ¿Me confirmás el nombre del producto para agregarlo a la cotización?');
+          await waSendText(fromId, 'Recibí la imagen. ¿Me confirmás el nombre del producto para agregarlo?');
         }
       } else {
         await waSendText(fromId, 'Recibí la imagen. Si me escribís el nombre del producto, lo agrego a tu cotización 😉');
       }
     }
 
-    if (config.DEBUG_LOGS) console.log('[IN <-]', type, incomingText);
-
-    // Atajos utilitarios inmediatos
+    // -------- Atajos utilitarios globales --------
     if (wantsCatalog(incomingText)) {
       await waSendText(fromId, `🛒 Catálogo: ${config.CATALOG_URL || 'No disponible'}`);
     }
@@ -192,19 +250,17 @@ router.post('/webhook', async (req, res) => {
       }
     }
     if (wantsHuman(incomingText)) {
-      s.pausedUntil = Date.now() + 4 * 60 * 60 * 1000; // 4h
-      await waSendText(fromId, '🧑‍💼 Te conecto con un asesor. Pauso el bot por 4 horas. Para volver escribí "continuar".');
-      saveSession(fromId, s);
-      return res.sendStatus(200);
+      s.pausedUntil = Date.now() + 4 * 60 * 60 * 1000;
+      await waSendText(fromId, '🧑‍💼 Te conecto con un asesor. Para volver conmigo, escribí "continuar".');
+      saveSession(fromId, s); return res.sendStatus(200);
     }
     if (wantsClose(incomingText)) {
       s.stage = 'closed';
       await waSendText(fromId, '✅ Conversación finalizada. ¡Gracias por contactarnos!');
-      saveSession(fromId, s);
-      return res.sendStatus(200);
+      saveSession(fromId, s); return res.sendStatus(200);
     }
 
-    // Carrito pegado (texto con viñetas)
+    // -------- Carrito pegado (texto con viñetas) --------
     if (type === 'text' && !/dep_|sub_|crop_|ha_|camp_|do_quote/.test(incomingText)) {
       const cart = parseCartFromText(incomingText);
       if (cart?.items?.length) {
@@ -213,11 +269,11 @@ router.post('/webhook', async (req, res) => {
       }
     }
 
-    // IA suave: acciones
+    // -------- IA suave: acciones --------
     const actions = await aiDecide(incomingText, s);
     for (const a of actions) applyActionToSession(s, a);
 
-    // Acciones utilitarias (por IA)
+    // Utilitario por IA
     if (actions.some(a => a.action === 'want_catalog')) {
       await waSendText(fromId, `🛒 Catálogo: ${config.CATALOG_URL || 'No disponible'}`);
     }
@@ -230,15 +286,13 @@ router.post('/webhook', async (req, res) => {
     }
     if (actions.some(a => a.action === 'want_human')) {
       s.pausedUntil = Date.now() + 4 * 60 * 60 * 1000;
-      await waSendText(fromId, '🧑‍💼 Te conecto con un asesor y pauso el bot por 4 horas. Para volver conmigo, escribí "continuar".');
-      saveSession(fromId, s);
-      return res.sendStatus(200);
+      await waSendText(fromId, '🧑‍💼 Te conecto con un asesor. Para volver, escribí "continuar".');
+      saveSession(fromId, s); return res.sendStatus(200);
     }
     if (actions.some(a => a.action === 'want_close')) {
       s.stage = 'closed';
       await waSendText(fromId, '✅ Conversación finalizada. ¡Gracias por contactarnos!');
-      saveSession(fromId, s);
-      return res.sendStatus(200);
+      saveSession(fromId, s); return res.sendStatus(200);
     }
 
     // Disponibilidad por texto (consultar catálogo)
@@ -248,10 +302,8 @@ router.post('/webhook', async (req, res) => {
       if (found) {
         s.items.push({ name: found.name, qty: 1, price: null });
         await waSendText(fromId, `Sí, contamos con *${found.name}*. Lo agrego a tu cotización 👌`);
-        const mediaId = await waUploadMediaFromFile(found.file, 'image/jpeg', `${found.name}.jpg`);
-        if (mediaId) await waSendImage(fromId, mediaId, found.name);
       } else {
-        await waSendText(fromId, 'Podría estar con otro nombre. ¿Me pasás cómo figura el producto? O mandá una foto :)');
+        await waSendText(fromId, 'Puede figurar con otro nombre. ¿Me lo decís o me mandás una foto con el nombre?');
       }
     }
 
@@ -264,33 +316,35 @@ router.post('/webhook', async (req, res) => {
       await waSendText(fromId, '💳 Aceptamos efectivo, QR y transferencia. ¿Querés que avance con tu cotización?');
     }
 
-    // ¿Listo para cotizar?
+    // -------- ¿Listo para cotizar? --------
     const ready = hasEnoughForQuote(s) || actions.some(a => a.action === 'want_quote') || wantsPrice(incomingText);
     if (ready) {
       s.stage = 'checkout';
-      await waSendText(fromId, `${summaryText(s)}\n\n¿Generamos tu PDF de cotización?`);
-      await waSendButtons(fromId, 'Generar PDF de cotización', btnCotizar());
+      await waSendText(fromId,
+        `${summaryText(s)}\n\n` +
+        '🧠 Si querés ajustar algo, decime. Si está bien, generamos el PDF:'
+      );
+      await waSendButtons(fromId, '¿Listo para *Cotizar*?', btnCotizar());
       saveSession(fromId, s);
       return res.sendStatus(200);
     }
 
-    // Si falta algo, pedir SOLO lo faltante
+    // -------- Falta algo: pedir SOLO lo que falta --------
     const missing = nextMissingSlot(s);
     if (missing) {
-      // tono amable y vendedor
-      switch (missing) {
-        case 'departamento':
-          await waSendText(fromId, 'Para darte el mejor precio con envío, decime tu *Departamento* 😊');
-          break;
-        case 'hectareas':
-          await waSendText(fromId, 'Anotá cuántas *Hectáreas* trabajás. Podés escribir el número.');
-          break;
-        default:
-          // cae en askForSlot
-          break;
-      }
+      const friendly = {
+        cultivo: 'Decime el *cultivo* y te paso opciones 😉',
+        hectareas: '¿Cuántas *hectáreas* vas a trabajar? Podés escribir el número.',
+        campana: '¿Para qué *campaña*? [Verano] [Invierno]',
+        departamento: 'Para estimar envío y condiciones, ¿en qué *Departamento* estás?',
+        subzona: 'Elegí tu *Subzona* de Santa Cruz:'
+      }[missing];
+      if (friendly) await waSendText(fromId, friendly);
       await askForSlot(fromId, missing);
+      saveSession(fromId, s);
+      return res.sendStatus(200);
     } else {
+      // Smalltalk / sin cambios: reencarrilar amablemente
       if (actions.some(a => a.action === 'smalltalk')) {
         await waSendText(fromId, '🙂 Te leo. Si querés, ya te preparo el PDF. ¿Vamos con *Campaña* o directo a *Cotizar*?');
         await waSendButtons(fromId, 'Elegí *Campaña* o Cotizar:', [
@@ -299,6 +353,43 @@ router.post('/webhook', async (req, res) => {
           { id: 'do_quote', title: '🧾 Cotizar' }
         ]);
       }
+    }
+
+    // -------- Cierre de venta: generar PDF --------
+    if (s.stage === 'checkout' && (incomingText === 'do_quote' || wantsPrice(incomingText))) {
+      if (!s.name) {
+        s.stage = 'checkout_wait_name';
+        await waSendText(fromId, '📄 Casi listo. ¿A nombre de quién emitimos la cotización? (Nombre y apellido)');
+        saveSession(fromId, s);
+        return res.sendStatus(200);
+      }
+      const { path: pdfPath, filename } = await buildQuote(s, fromId);
+      const mediaId = await waUploadMediaFromFile(pdfPath, 'application/pdf', filename);
+      if (mediaId) {
+        await waSendDocument(fromId, mediaId, filename, '🧾 Cotización generada automáticamente.');
+      } else {
+        await waSendText(fromId, 'No pude subir el PDF a WhatsApp. Intentá de nuevo en un momento.');
+      }
+      try { await sheetsAppendFromSession(s, fromId, 'closed'); } catch {}
+      s.stage = 'closed';
+      saveSession(fromId, s);
+      return res.sendStatus(200);
+    }
+
+    // Si estamos esperando nombre y el cliente lo envía → cotizar
+    if (s.stage === 'checkout_wait_name' && looksLikeFullName(incomingText)) {
+      s.name = incomingText.trim();
+      const { path: pdfPath, filename } = await buildQuote(s, fromId);
+      const mediaId = await waUploadMediaFromFile(pdfPath, 'application/pdf', filename);
+      if (mediaId) {
+        await waSendDocument(fromId, mediaId, filename, '🧾 Cotización lista. ¡Gracias!');
+      } else {
+        await waSendText(fromId, 'No pude subir el PDF a WhatsApp. Intentá de nuevo en un momento.');
+      }
+      try { await sheetsAppendFromSession(s, fromId, 'closed'); } catch {}
+      s.stage = 'closed';
+      saveSession(fromId, s);
+      return res.sendStatus(200);
     }
 
     saveSession(fromId, s);

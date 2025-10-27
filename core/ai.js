@@ -21,31 +21,25 @@ function wantsQuote(text) {
   const t = norm(text);
   return /(cotiza|cotizame|presupuesto|pdf|precio|cuanto sale|cuánto sale)/.test(t);
 }
-
 function wantsAvailability(text) {
   const t = norm(text);
   return /(tiene(n)?|hay|maneja(n)?|trabaja(n)?|disponible|stock)/.test(t);
 }
-
 function wantsShipping(text) {
   const t = norm(text);
   return /(envio|envio(s)?|envian|envían|entrega|delivery|mandan)/.test(t);
 }
-
 function wantsPayment(text) {
   const t = norm(text);
   return /(pago|pagar|medios de pago|qr|transferencia|efectivo|tarjeta|factura)/.test(t);
 }
-
 function addItemIntent(text) {
   const t = norm(text);
-  // patrones simples: "agrega 3 de X", "sumá 2 bidones Y"
   const m = t.match(/(agrega|agregame|suma|sumame|anade|añade)\s+(\d+)\s+(de\s+)?(.+)/);
   if (m) return { qty: Number(m[2]), name: m[4] };
   return null;
 }
 
-// Devuelve lista de acciones
 export async function aiDecide(message, session) {
   const actions = [];
   const t = message || '';
@@ -60,7 +54,6 @@ export async function aiDecide(message, session) {
   if (wantsShipping(t)) actions.push({ action: 'want_shipping' });
   if (wantsPayment(t)) actions.push({ action: 'want_payment' });
 
-  // Carrito por texto (agregar item suelto)
   const add = addItemIntent(t);
   if (add) actions.push({ action: 'add_item', value: add });
 
@@ -85,8 +78,6 @@ export async function aiDecide(message, session) {
   // Cierre
   if (wantsPrice(t) || wantsQuote(t)) actions.push({ action: 'want_quote' });
 
-  // Si nada útil, smalltalk para reencarrilar
   if (actions.length === 0) actions.push({ action: 'smalltalk' });
-
   return actions;
 }
