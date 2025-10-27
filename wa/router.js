@@ -2,6 +2,7 @@
 import express from 'express';
 import { config } from '../env.js';
 import { loadSession, saveSession } from '../core/session.js';
+import { aiDecide } from '../core/ai.js';
 import {
   wantsCatalog, wantsHuman, wantsLocation, wantsClose, wantsPrice,
   looksLikeFullName, detectDepartamento, detectSubzona, parseHectareas
@@ -28,6 +29,68 @@ function seen(wamid) {
   if (processed.has(wamid)) return true;
   processed.set(wamid, now);
   return false;
+}
+
+// ------- Utils de orquestación (flujo abierto) -------
+function hasEnoughForQuote(s) {
+  const base = s.name && s.departamento && s.cultivo && (s.hectareas !== null && s.hectareas !== undefined) && s.campana;
+  const subOk = (s.departamento === 'Santa Cruz') ? !!s.subzona : true;
+  const cartOk = s.items && s.items.length > 0;
+  return (base && subOk) || (cartOk && s.name && s.departamento);
+}
+
+function nextMissingSlot(s) {
+  if (!s.name) return 'name';
+  if (!s.departamento) return 'departamento';
+  if (s.departamento === 'Santa Cruz' && !s.subzona) return 'subzona';
+  if (!s.cultivo) return 'cultivo';
+  if (s.hectareas === null || s.hectareas === undefined) return 'hectareas';
+  if (!s.campana) return 'campana';
+  return null;
+}
+
+async function askForSlot(to, slot) {
+  switch (slot) {
+    case 'name':
+      return waSendText(to, '¿Cómo te llamas? (Nombre y apellido)');
+    case 'departamento':
+      return waSendButtons(to, 'Elegí tu *Departamento*:', btnsDepartamento());
+    case 'subzona':
+      return waSendButtons(to, 'Seleccioná tu *Subzona* en Santa Cruz:', btnsSubzonaSCZ());
+    case 'cultivo':
+      return waSendButtons(to, 'Seleccioná tu *Cultivo*:', btnsCultivos());
+    case 'hectareas':
+      await waSendButtons(to, '¿Cuántas *Hectáreas*?', btnsHectareas());
+      return waSendText(to, 'También podés escribir la cantidad (por ejemplo: 120).');
+    case 'campana':
+      return waSendButtons(to, '¿Para qué *Campaña*?', btnsCampana());
+    default:
+      return null;
+  }
+}
+
+function applyActionToSession(s, a) {
+  switch (a.action) {
+    case 'set_name': if (!s.name && looksLikeFullName(a.value)) s.name = a.value; break;
+    case 'set_departamento': {
+      const dep = detectDepartamento(a.value) || a.value;
+      if (dep) { s.departamento = dep; if (dep !== 'Santa Cruz') s.subzona = s.subzona || null; }
+      break;
+    }
+    case 'set_subzona': {
+      const sub = detectSubzona(a.value) || a.value;
+      if (sub) s.subzona = sub;
+      break;
+    }
+    case 'set_cultivo': s.cultivo = a.value; break;
+    case 'set_hectareas': {
+      const h = parseHectareas(String(a.value));
+      if (Number.isFinite(h)) s.hectareas = h;
+      break;
+    }
+    case 'set_campana': s.campana = a.value; break;
+    // add_cart_items lo manejamos afuera con parseCartFromText
+  }
 }
 
 // ------- GET /wa/webhook (verify) -------
@@ -60,8 +123,9 @@ router.post('/webhook', async (req, res) => {
 
     let s = loadSession(fromId);
     s.lastWamid = wamid;
+    s.stage = s.stage || 'discovery';
 
-    // Si está pausado (asesor humano)
+    // Pausa por asesor humano
     if (s.pausedUntil && Date.now() < s.pausedUntil) {
       if (/bot|continuar|reanudar/i.test(msg?.text?.body || '')) {
         s.pausedUntil = 0;
@@ -73,7 +137,7 @@ router.post('/webhook', async (req, res) => {
       }
     }
 
-    // Parseo de contenido entrante
+    // Normalizar entrada
     let incomingText = '';
     if (type === 'text') incomingText = msg.text?.body || '';
     if (type === 'interactive') {
@@ -87,131 +151,86 @@ router.post('/webhook', async (req, res) => {
     }
     if (config.DEBUG_LOGS) console.log('[IN <-]', type, incomingText);
 
-    // Intenciones globales
+    // 0) Atajos globales inmediatos
     if (wantsCatalog(incomingText)) {
       await waSendText(fromId, `🛒 Catálogo: ${config.CATALOG_URL || 'No disponible'}`);
-    } else if (wantsLocation(incomingText)) {
+    }
+    if (wantsLocation(incomingText)) {
       if (config.STORE_LAT && config.STORE_LNG) {
         await waSendText(fromId, `📍 Estamos aquí: https://www.google.com/maps?q=${config.STORE_LAT},${config.STORE_LNG}`);
       } else {
         await waSendText(fromId, '📍 Nuestra ubicación estará disponible pronto.');
       }
-    } else if (wantsHuman(incomingText)) {
+    }
+    if (wantsHuman(incomingText)) {
       s.pausedUntil = Date.now() + 4 * 60 * 60 * 1000; // 4h
       await waSendText(fromId, '🧑‍💼 Te conectamos con un asesor. El bot se pausará por 4 horas.');
       saveSession(fromId, s);
       return res.sendStatus(200);
-    } else if (wantsClose(incomingText)) {
+    }
+    if (wantsClose(incomingText)) {
       s.stage = 'closed';
       await waSendText(fromId, '✅ Conversación finalizada. ¡Gracias por contactarnos!');
       saveSession(fromId, s);
       return res.sendStatus(200);
     }
 
-    // Carrito pegado por texto
+    // 1) Carrito pegado (atajo a checkout)
     if (type === 'text' && !/dep_|sub_|crop_|ha_|camp_|do_quote/.test(incomingText)) {
       const cart = parseCartFromText(incomingText);
-      if (cart) {
+      if (cart?.items?.length) {
         s.items = cart.items;
         s.stage = 'checkout';
-        await waSendText(fromId, '🧺 Detecté tu carrito. Preparando resumen…');
-        await waSendText(fromId, `${summaryText(s)}\n\n¿Generamos tu PDF de cotización?`);
-        await waSendButtons(fromId, 'Generar PDF de cotización', [{ id: 'do_quote', title: '🧾 Cotizar' }]);
-        saveSession(fromId, s);
-        return res.sendStatus(200);
       }
     }
 
-    // Flujo guiado
-    if (s.stage === 'discovery') {
-      if (!s.name) {
-        if (looksLikeFullName(incomingText)) {
-          s.name = incomingText.trim();
-          await waSendButtons(fromId, 'Elige tu *Departamento*:', btnsDepartamento());
-        } else {
-          await waSendText(fromId, `¡Hola ${profileName || ''}!\nSoy tu asistente. ¿Cómo te llamas? (Nombre y apellido)`);
-        }
-      } else if (!s.departamento) {
-        const dep = incomingText.startsWith('dep_')
-          ? ({ 'dep_0':'Santa Cruz','dep_1':'Beni','dep_2':'Pando','dep_3':'La Paz','dep_4':'Cochabamba','dep_5':'Oruro','dep_6':'Potosí','dep_7':'Chuquisaca','dep_8':'Tarija' }[incomingText])
-          : detectDepartamento(incomingText);
-        if (dep) {
-          s.departamento = dep;
-          if (dep === 'Santa Cruz') {
-            await waSendButtons(fromId, 'Selecciona tu *Subzona* en Santa Cruz:', btnsSubzonaSCZ());
-          } else {
-            await waSendButtons(fromId, 'Selecciona tu *Cultivo*:', btnsCultivos());
-            s.stage = 'product';
-          }
-        } else {
-          await waSendButtons(fromId, 'Por favor, elige un *Departamento*:', btnsDepartamento());
-        }
-      } else if (s.departamento === 'Santa Cruz' && !s.subzona) {
-        const sub = incomingText.startsWith('sub_')
-          ? (['Norte Integrado','Chiquitania','Vallegrande','Cordillera','Andrés Ibáñez','Warnes','Obispo Santistevan'][Number(incomingText.split('_')[1])])
-          : detectSubzona(incomingText);
-        if (sub) {
-          s.subzona = sub;
-          await waSendButtons(fromId, 'Selecciona tu *Cultivo*:', btnsCultivos());
-          s.stage = 'product';
-        } else {
-          await waSendButtons(fromId, 'Elige una *Subzona* de Santa Cruz:', btnsSubzonaSCZ());
-        }
-      }
-    }
+    // 2) IA suave: decidir acciones
+    const actions = await aiDecide(incomingText, s);
+    for (const a of actions) applyActionToSession(s, a);
 
-    if (s.stage === 'product') {
-      if (!s.cultivo) {
-        if (incomingText.startsWith('crop_')) {
-          const idx = Number(incomingText.split('_')[1]);
-          s.cultivo = ['Soya','Maíz','Trigo','Arroz','Girasol','Otro…'][idx] || 'Otro…';
-          await waSendButtons(fromId, '¿Cuántas *Hectáreas*?', btnsHectareas());
-        } else if (['soya','maíz','maiz','trigo','arroz','girasol','otro','otro…'].includes((incomingText||'').toLowerCase())) {
-          s.cultivo = incomingText[0].toUpperCase() + incomingText.slice(1);
-          await waSendButtons(fromId, '¿Cuántas *Hectáreas*?', btnsHectareas());
-        } else {
-          await waSendButtons(fromId, 'Selecciona tu *Cultivo*:', btnsCultivos());
-        }
-      } else if (!s.hectareas) {
-        if (incomingText.startsWith('ha_')) {
-          const idx = Number(incomingText.split('_')[1]);
-          s.hectareas = ['<50','50-100','100-300','300-500','>500','Otra…'][idx] || 'Otra…';
-          await waSendButtons(fromId, '¿Para qué *Campaña*?', btnsCampana());
-        } else {
-          const h = parseHectareas(incomingText);
-          if (h) {
-            s.hectareas = h;
-            await waSendButtons(fromId, '¿Para qué *Campaña*?', btnsCampana());
-          } else {
-            await waSendButtons(fromId, 'Elige un rango de *Hectáreas*:', btnsHectareas());
-          }
-        }
-      } else if (!s.campana) {
-        if (incomingText.startsWith('camp_')) {
-          s.campana = incomingText === 'camp_verano' ? 'Verano' : 'Invierno';
-          s.stage = 'checkout';
-          await waSendText(fromId, `${summaryText(s)}\n\n¿Deseas una cotización en PDF?`);
-          await waSendButtons(fromId, 'Generar PDF de cotización', btnCotizar());
-        } else {
-          await waSendButtons(fromId, 'Elige *Campaña*:', btnsCampana());
-        }
-      }
+    // 3) Respuestas utilitarias (ya priorizadas arriba, pero por si vinieron por IA)
+    if (actions.some(a => a.action === 'want_catalog')) {
+      await waSendText(fromId, `🛒 Catálogo: ${config.CATALOG_URL || 'No disponible'}`);
     }
-
-    // Checkout / PDF
-    if (s.stage === 'checkout') {
-      if (incomingText === 'do_quote' || wantsPrice(incomingText)) {
-        const { path: pdfPath, filename } = await buildQuote(s, fromId);
-        const mediaId = await waUploadMediaFromFile(pdfPath, 'application/pdf', filename);
-        if (mediaId) {
-          await waSendDocument(fromId, mediaId, filename, '🧾 Cotización generada automáticamente.');
-        } else {
-          await waSendText(fromId, 'No pude subir el PDF a WhatsApp. Intenta más tarde.');
-        }
-        try { await sheetsAppendFromSession(s, fromId, 'closed'); } catch {}
-        s.stage = 'closed';
+    if (actions.some(a => a.action === 'want_location')) {
+      if (config.STORE_LAT && config.STORE_LNG) {
+        await waSendText(fromId, `📍 Estamos aquí: https://www.google.com/maps?q=${config.STORE_LAT},${config.STORE_LNG}`);
       } else {
-        await waSendButtons(fromId, '¿Generamos tu PDF de cotización?', btnCotizar());
+        await waSendText(fromId, '📍 Nuestra ubicación estará disponible pronto.');
+      }
+    }
+    if (actions.some(a => a.action === 'want_human')) {
+      s.pausedUntil = Date.now() + 4 * 60 * 60 * 1000;
+      await waSendText(fromId, '🧑‍💼 Te conectamos con un asesor. El bot se pausará por 4 horas.');
+      saveSession(fromId, s);
+      return res.sendStatus(200);
+    }
+    if (actions.some(a => a.action === 'want_close')) {
+      s.stage = 'closed';
+      await waSendText(fromId, '✅ Conversación finalizada. ¡Gracias por contactarnos!');
+      saveSession(fromId, s);
+      return res.sendStatus(200);
+    }
+
+    // 4) ¿Listo para cotizar?
+    const ready = hasEnoughForQuote(s) || actions.some(a => a.action === 'want_quote') || wantsPrice(incomingText);
+    if (ready) {
+      s.stage = 'checkout';
+      await waSendText(fromId, `${summaryText(s)}\n\n¿Generamos tu PDF de cotización?`);
+      await waSendButtons(fromId, 'Generar PDF de cotización', btnCotizar());
+      saveSession(fromId, s);
+      return res.sendStatus(200);
+    }
+
+    // 5) Si falta algo, pedí SOLO lo que falta (flujo abierto)
+    const missing = nextMissingSlot(s);
+    if (missing) {
+      await askForSlot(fromId, missing);
+    } else {
+      // Smalltalk / sin cambios: reencarrilar amablemente
+      if (actions.some(a => a.action === 'smalltalk')) {
+        await waSendText(fromId, '🙂 Te escucho. Si querés, puedo ir preparando tu cotización. ¿Definimos *Campaña*?');
+        await waSendButtons(fromId, 'Elegí *Campaña*:', btnsCampana());
       }
     }
 
