@@ -1,118 +1,110 @@
 // core/ai.js
 import OpenAI from "openai";
-const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY || "" });
 
-const MODEL_VISION = process.env.OPENAI_MODEL_VISION || "gpt-4o-mini";
-const MODEL_TEXT   = process.env.OPENAI_MODEL_TEXT   || "gpt-4o-mini";
-const AI_DEBUG     = process.env.AI_DEBUG === "1";
+// Cliente OpenAI opcional (no rompe si no hay API key)
+export const openai = process.env.OPENAI_API_KEY
+  ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
+  : null;
 
-/**
- * Pequeño “contrato” de salida para que la IA NO devuelva bla-bla,
- * solo JSON con { action, reason?, entities?, cart? }.
- */
-function iaSystemPrompt() {
-  return `
-Eres un orquestador de conversaciones de ventas para agroquímicos.
-Devuelve SIEMPRE un JSON válido con estas claves:
+// Utilidades de normalización y títulos
+export const norm = (t = "") =>
+  t.toLowerCase().normalize("NFD").replace(/\p{Diacritic}/gu, "");
+export const title = (s = "") =>
+  String(s)
+    .trim()
+    .replace(/\s+/g, " ")
+    .replace(/\w\S*/g, (w) => w[0].toUpperCase() + w.slice(1).toLowerCase());
 
-- action: one of [
-  "ask_nombre","ask_departamento","ask_subzona",
-  "ask_cultivo","ask_hectareas","ask_campana",
-  "show_catalog","add_to_cart","summarize","close_quote",
-  "handoff_human","smalltalk"
-]
-- entities: { nombre?, departamento?, subzona?, cultivo?, hectareas?, campana?, producto?, cantidad? }
-- cart: [{ nombre, presentacion?, cantidad? }]  // opcional si infieres un pedido
-- reason: breve explicación (string)
+// Catálogos de ubicaciones
+export const DEPARTAMENTOS = [
+  "Santa Cruz",
+  "Cochabamba",
+  "La Paz",
+  "Chuquisaca",
+  "Tarija",
+  "Oruro",
+  "Potosí",
+  "Beni",
+  "Pando",
+];
 
-Reglas:
-- Si el usuario quiere hablar con humano: action="handoff_human".
-- Si detectas intención de cerrar, usa action="close_quote".
-- Si falta algún dato clave, usa la acción ask_* correspondiente.
-- Nunca salgas del JSON.
-`;
+const SUBZONAS_SCZ = [
+  "Norte Integrado",
+  "Norte",
+  "Este",
+  "Sur",
+  "Valles",
+  "Chiquitania",
+];
+
+// === Parsers / NLU “clásicos” (sin LLM) ===
+export function parseHectareas(text = "") {
+  //  "300 ha" | "300" | "301–500 ha" | "100-300"
+  const m1 = String(text).match(/(\d{1,6}(?:[.,]\d{1,2})?)\s*(ha|hect[aá]reas?)/i);
+  if (m1) return m1[1].replace(",", ".");
+  const m2 = String(text).match(/^\s*(\d{1,6}(?:[.,]\d{1,2})?)\s*$/);
+  if (m2) return m2[1].replace(",", ".");
+  // Rango legible
+  const m3 = String(text).match(/(\d{1,6})\s*[–-]\s*(\d{1,6})/);
+  if (m3) return `${m3[1]}–${m3[2]}`;
+  return null;
 }
 
-export async function aiDecideNext({ message, session }) {
-  const vars = session?.vars || {};
-  const context = {
-    known: {
-      nombre: session?.profileName || null,
-      departamento: vars.departamento || null,
-      subzona: vars.subzona || null,
-      cultivo: (vars.cultivos && vars.cultivos[0]) || null,
-      hectareas: vars.hectareas || null,
-      campana: vars.campana || null
-    },
-    cart: vars.cart || []
-  };
-
-  const user = typeof message === "string" ? message : (message?.text || "");
-  const sys = iaSystemPrompt();
-
-  const resp = await client.chat.completions.create({
-    model: MODEL_TEXT,
-    temperature: 0.2,
-    messages: [
-      { role: "system", content: sys },
-      { role: "user", content: JSON.stringify({ user, context }) }
-    ],
-    response_format: { type: "json_object" }
-  });
-
-  const out = safeJSON(resp.choices?.[0]?.message?.content);
-  if (AI_DEBUG) console.log("[AI decide] =>", out);
-  return out || { action: "smalltalk", reason: "fallback" };
+export function detectDepartamento(text = "") {
+  const t = norm(text);
+  for (const d of DEPARTAMENTOS) {
+    if (t.includes(norm(d))) return d;
+  }
+  return null;
 }
 
-function safeJSON(s) { try { return JSON.parse(s); } catch { return null; } }
+export function detectSubzona(text = "") {
+  const t = norm(text);
+  for (const z of SUBZONAS_SCZ) {
+    if (t.includes(norm(z))) return z;
+  }
+  return null;
+}
 
-/**
- * Dado una imagen de usuario, pregunta a la IA visión si coincide con un
- * producto del catálogo. Le pasamos lista de candidatos (nombre + alias).
- * 
- * @param {string} imageUrl - URL pública de la imagen (o data URL)
- * @param {Array} catalog - productos [{nombre, syns?, imagen?}, ...]
- * @returns { { match: {nombre, presentacion?} | null, confidence: number, reason: string } }
- */
-export async function aiMatchCatalogFromImage({ imageUrl, catalog }) {
-  const topK = 12; // no pases catálogos enormes de golpe; recorta si es muy grande
-  const mini = (catalog || []).slice(0, topK).map(p => ({
-    nombre: p.nombre,
-    presentacion: p.presentacion || null,
-    alias: [
-      p.ingrediente_activo, p.ia, p.activo,
-      ...(Array.isArray(p.syns_activo) ? p.syns_activo : []),
-      ...(Array.isArray(p.alias) ? p.alias : [])
-    ].filter(Boolean)
-  }));
+export function shouldCloseNow(text = "") {
+  // Señales de intención de cierre / avanzar a PDF
+  const t = norm(text);
+  return /(cotizar|proforma|finalizar|cerrar pedido|generar pdf|enviar pedido)/i.test(t);
+}
 
-  const prompt = [
-    "Tarea: dime cuál de estos productos del catálogo se parece más a la FOTO del usuario.",
-    "Devuelve estrictamente JSON: {match:{nombre, presentacion?}|null, confidence:0..1, reason:string}",
-    "Catálogo:",
-    JSON.stringify(mini)
-  ].join("\n");
-
-  const msgs = [
-    { role: "system", content: "Eres un experto reconociendo etiquetas/fichas de productos agroquímicos." },
-    {
-      role: "user",
-      content: [
-        { type: "text", text: prompt },
-        { type: "input_image", image_url: { url: imageUrl } }
-      ]
-    }
-  ];
-
-  const resp = await client.chat.completions.create({
-    model: MODEL_VISION,
-    messages: msgs,
-    temperature: 0.2,
-    response_format: { type: "json_object" }
-  });
-
-  const out = safeJSON(resp.choices?.[0]?.message?.content) || { match:null, confidence:0, reason:"" };
-  if (AI_DEBUG) console.log("[AI vision] =>", out);
-  return out;
+// === Visión (opcional): detectar producto desde imagen ===
+// Devuelve { match:true, producto:"GLISATO" } o null sin match.
+// Para producción puedes afinar con embeddings + nombres de archivo en /image.
+export async function detectProductFromImage({ url, b64 } = {}) {
+  if (!openai) return null;
+  try {
+    const msg = [
+      {
+        role: "system",
+        content:
+          "Eres un verificador de productos. Devuelves solo el nombre comercial si reconoces uno de estos: GLISATO, DRIER, LAYER, NICOXAM, TRENCH. Si no estás seguro, responde 'NONE'.",
+      },
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "¿Qué producto del catálogo aparece?" },
+          url
+            ? { type: "image_url", image_url: { url } }
+            : { type: "input_image", image_data: b64 },
+        ],
+      },
+    ];
+    const resp = await openai.chat.completions.create({
+      model: "gpt-4o-mini",
+      messages: msg,
+      temperature: 0,
+    });
+    const raw = resp.choices?.[0]?.message?.content?.trim() || "NONE";
+    const name = raw.toUpperCase().replace(/[^A-Z]/g, "");
+    const known = ["GLISATO", "DRIER", "LAYER", "NICOXAM", "TRENCH"];
+    if (known.includes(name)) return { match: true, producto: name };
+    return null;
+  } catch {
+    return null;
+  }
 }
