@@ -40,7 +40,7 @@ function isMenuCommand(t = '') {
   return /\b(volver|menu|menú|inicio|principal)\b/i.test(t || '');
 }
 function goHome(to, s) {
-  s.mode = null;
+  exitModes(s);
   s.awaitingSlot = null;
   s.awaitingAt = 0;
   waSendText(
@@ -57,23 +57,23 @@ function goHome(to, s) {
 function shouldAskSlot(s, slot) {
   const now = Date.now();
   if (s.awaitingSlot === slot && s.awaitingAt && (now - s.awaitingAt) < 45000) {
-    return false; // ya lo pedimos hace poco
+    return false; // ya se pidió hace menos de 45s
   }
   s.awaitingSlot = slot;
   s.awaitingAt = now;
   return true;
 }
+function exitModes(s) {
+  s.mode = null; // salir de FAQ/otros modos conversacionales
+}
 
-// ------- Utils de orquestación (flujo abierto) -------
+// ------- Orquestación (flujo abierto) -------
 function hasEnoughForQuote(s) {
-  // NO pedimos nombre aquí; se pide justo antes del PDF
   const base = s.departamento && s.cultivo && (s.hectareas !== null && s.hectareas !== undefined) && s.campana;
   const subOk = (s.departamento === 'Santa Cruz') ? !!(s.subzona) : true;
   const cartOk = s.items && s.items.length > 0;
   return (base && subOk) || (cartOk && s.departamento);
 }
-
-// Orden conversacional: producto → ha → campaña → dpto → subzona → (nombre al cerrar)
 function nextMissingSlot(s) {
   if (!s.cultivo) return 'cultivo';
   if (s.hectareas === null || s.hectareas === undefined) return 'hectareas';
@@ -82,7 +82,6 @@ function nextMissingSlot(s) {
   if (s.departamento === 'Santa Cruz' && !s.subzona) return 'subzona';
   return null; // nombre al final
 }
-
 async function askForSlot(to, slot, s) {
   if (!shouldAskSlot(s, slot)) return; // evitar loop
   switch (slot) {
@@ -105,7 +104,6 @@ async function askForSlot(to, slot, s) {
       break;
   }
 }
-
 function applyActionToSession(s, a) {
   switch (a.action) {
     case 'set_name':
@@ -113,11 +111,7 @@ function applyActionToSession(s, a) {
       break;
     case 'set_departamento': {
       const dep = detectDepartamento(a.value) || a.value;
-      if (dep) {
-        s.departamento = dep;
-        if (dep !== 'Santa Cruz') s.subzona = s.subzona || null;
-        s.awaitingSlot = null; s.awaitingAt = 0;
-      }
+      if (dep) { s.departamento = dep; if (dep !== 'Santa Cruz') s.subzona = s.subzona || null; s.awaitingSlot = null; s.awaitingAt = 0; }
       break;
     }
     case 'set_subzona': {
@@ -126,18 +120,14 @@ function applyActionToSession(s, a) {
       break;
     }
     case 'set_cultivo':
-      s.cultivo = a.value;
-      s.awaitingSlot = null; s.awaitingAt = 0;
-      break;
+      s.cultivo = a.value; s.awaitingSlot = null; s.awaitingAt = 0; break;
     case 'set_hectareas': {
       const h = parseHectareas(String(a.value));
       if (Number.isFinite(h)) { s.hectareas = h; s.awaitingSlot = null; s.awaitingAt = 0; }
       break;
     }
     case 'set_campana':
-      s.campana = a.value;
-      s.awaitingSlot = null; s.awaitingAt = 0;
-      break;
+      s.campana = a.value; s.awaitingSlot = null; s.awaitingAt = 0; break;
     case 'add_item': {
       const { qty, name } = a.value || {};
       if (!name) break;
@@ -235,6 +225,7 @@ router.post('/webhook', async (req, res) => {
 
     // -------- Botones de bienvenida --------
     if (incomingText === 'btn_catalog') {
+      exitModes(s);
       await waSendText(fromId, `🛒 Catálogo: ${config.CATALOG_URL || 'No disponible'}`);
       await waSendText(fromId, 'Decime qué producto te interesa y te lo cotizo 😉\nEscribí *volver* para regresar al menú.');
       saveSession(fromId, s);
@@ -249,6 +240,7 @@ router.post('/webhook', async (req, res) => {
       return res.sendStatus(200);
     }
     if (incomingText === 'btn_quote') {
+      exitModes(s);
       const missing = nextMissingSlot(s) || 'cultivo';
       await waSendText(fromId, '¡Perfecto! Armemos tu cotización rápido 😊');
       await askForSlot(fromId, missing, s);
@@ -257,7 +249,10 @@ router.post('/webhook', async (req, res) => {
     }
     if (incomingText === 'btn_faq') {
       s.mode = 'faq';
-      await waSendText(fromId, 'Contame tu consulta. Ej: "¿qué herbicida para soja?", "me atacan chinches", "¿qué me recomendás?"');
+      await waSendText(fromId,
+        'Genial, contame tu consulta (ej: "¿qué herbicida para soja?", "me atacan chinches", "¿qué me recomendás?").\n' +
+        'Cuando quieras regresar al menú, escribí *volver*.'
+      );
       saveSession(fromId, s);
       return res.sendStatus(200);
     }
@@ -300,6 +295,7 @@ router.post('/webhook', async (req, res) => {
       if (cult) {
         s.cultivo = cult;
         s.awaitingSlot = null; s.awaitingAt = 0;
+        exitModes(s);
         await waSendButtons(fromId, '¿Cuántas *hectáreas* vas a trabajar?', btnsHectareas());
         saveSession(fromId, s);
         return res.sendStatus(200);
@@ -309,6 +305,7 @@ router.post('/webhook', async (req, res) => {
       const val = incomingText.slice(3);
       const num = Number(val.replace(/[^\d]/g, ''));
       if (Number.isFinite(num) && num > 0) { s.hectareas = num; s.awaitingSlot = null; s.awaitingAt = 0; }
+      exitModes(s);
       await waSendButtons(fromId, '¿Para qué *campaña*?', btnsCampana());
       saveSession(fromId, s);
       return res.sendStatus(200);
@@ -318,6 +315,7 @@ router.post('/webhook', async (req, res) => {
       s.campana = (id === 'verano') ? 'Verano' : (id === 'invierno') ? 'Invierno' : null;
       if (s.campana) {
         s.awaitingSlot = null; s.awaitingAt = 0;
+        exitModes(s);
         if (!s.departamento) {
           await waSendButtons(fromId, '¿En qué *Departamento* estás?', btnsDepartamento());
         } else {
@@ -336,6 +334,7 @@ router.post('/webhook', async (req, res) => {
       const p = findProductBySlug(catalog, slug);
       if (p) {
         s.items.push({ name: p.name, qty: 1, price: null });
+        exitModes(s);
         await waSendText(fromId, `🛒 Agregué *${p.name}* a tu cotización.`);
         s.stage = s.stage || 'product';
         if (!s.cultivo) await waSendButtons(fromId, '¿Para qué *cultivo* es?', btnsCultivos());
@@ -446,8 +445,8 @@ router.post('/webhook', async (req, res) => {
       return res.sendStatus(200);
     }
 
-    // Preguntas / Dudas (FAQ)
-    if (s.mode === 'faq' || actions.some(a => a.action === 'want_advice')) {
+    // Preguntas / Dudas (FAQ) — sólo con TEXTO del usuario
+    if ((s.mode === 'faq' && type === 'text') || actions.some(a => a.action === 'want_advice')) {
       const raw = actions.find(a => a.action === 'want_advice')?.value || incomingText || '';
       const adv = getAdvice(raw, catalog);
       await waSendText(fromId, adv.text);
@@ -460,6 +459,8 @@ router.post('/webhook', async (req, res) => {
       } else {
         await waSendButtons(fromId, '¿Te ayudo a elegir por *cultivo*?', btnsCultivos());
       }
+      // Si fue texto, seguimos en FAQ; si no, salimos para evitar loops
+      if (type !== 'text') exitModes(s);
       saveSession(fromId, s);
       return res.sendStatus(200);
     }
