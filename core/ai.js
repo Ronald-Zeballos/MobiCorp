@@ -1,44 +1,70 @@
 // core/ai.js
-// "IA suave": devuelve ACCIONES a partir del mensaje + sesión.
-// No depende de OpenAI. Usa heurísticas y tus detectores actuales.
-
 import {
   wantsCatalog, wantsHuman, wantsLocation, wantsClose, wantsPrice,
   looksLikeFullName, detectDepartamento, detectSubzona, parseHectareas, CROP_OPTIONS
 } from './intents.js';
 
-const norm = (s='') => s.toString().trim().toLowerCase();
+const norm = (s='') => s.toString().trim().toLowerCase()
+  .normalize('NFD').replace(/\p{Diacritic}/gu, '');
 
-// Extrae cultivo si lo menciona
 function detectCultivo(text) {
-  const t = norm(text).normalize('NFD').replace(/\p{Diacritic}/gu,'');
+  const t = norm(text);
   for (const c of CROP_OPTIONS) {
-    const cc = c.toLowerCase().normalize('NFD').replace(/\p{Diacritic}/gu,'');
+    const cc = norm(c);
     if (t.includes(cc) || t === cc) return c;
   }
-  // sinónimo
   if (/\bmaiz\b/.test(t)) return 'Maíz';
   return null;
 }
 
-// Detecta "cotizar"
 function wantsQuote(text) {
   const t = norm(text);
-  return /(cotiza(r)?|pdf|presupuesto|enviame el pdf|armar pdf)/.test(t);
+  return /(cotiza|cotizame|presupuesto|pdf|precio|cuanto sale|cuánto sale)/.test(t);
 }
 
-// Recolecta "acciones" a partir del texto
+function wantsAvailability(text) {
+  const t = norm(text);
+  return /(tiene(n)?|hay|maneja(n)?|trabaja(n)?|disponible|stock)/.test(t);
+}
+
+function wantsShipping(text) {
+  const t = norm(text);
+  return /(envio|envio(s)?|envian|envían|entrega|delivery|mandan)/.test(t);
+}
+
+function wantsPayment(text) {
+  const t = norm(text);
+  return /(pago|pagar|medios de pago|qr|transferencia|efectivo|tarjeta|factura)/.test(t);
+}
+
+function addItemIntent(text) {
+  const t = norm(text);
+  // patrones simples: "agrega 3 de X", "sumá 2 bidones Y"
+  const m = t.match(/(agrega|agregame|suma|sumame|anade|añade)\s+(\d+)\s+(de\s+)?(.+)/);
+  if (m) return { qty: Number(m[2]), name: m[4] };
+  return null;
+}
+
+// Devuelve lista de acciones
 export async function aiDecide(message, session) {
   const actions = [];
   const t = message || '';
 
-  // Atajos/utilidades (prioridad)
+  // Atajos/utilidades
   if (wantsClose(t)) actions.push({ action: 'want_close' });
   if (wantsHuman(t)) actions.push({ action: 'want_human' });
   if (wantsCatalog(t)) actions.push({ action: 'want_catalog' });
   if (wantsLocation(t)) actions.push({ action: 'want_location' });
 
-  // Datos (slots)
+  if (wantsAvailability(t)) actions.push({ action: 'want_availability', value: t });
+  if (wantsShipping(t)) actions.push({ action: 'want_shipping' });
+  if (wantsPayment(t)) actions.push({ action: 'want_payment' });
+
+  // Carrito por texto (agregar item suelto)
+  const add = addItemIntent(t);
+  if (add) actions.push({ action: 'add_item', value: add });
+
+  // Slots
   if (looksLikeFullName(t)) actions.push({ action: 'set_name', value: t.trim() });
 
   const dep = detectDepartamento(t);
@@ -59,7 +85,7 @@ export async function aiDecide(message, session) {
   // Cierre
   if (wantsPrice(t) || wantsQuote(t)) actions.push({ action: 'want_quote' });
 
-  // Si no detectamos nada útil: smalltalk para reencarrilar
+  // Si nada útil, smalltalk para reencarrilar
   if (actions.length === 0) actions.push({ action: 'smalltalk' });
 
   return actions;

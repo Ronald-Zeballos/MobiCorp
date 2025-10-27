@@ -147,7 +147,18 @@ export async function waUploadMediaFromFile(filePath, mime = 'application/octet-
     return null;
   }
 }
-
+export function waSendImage(to, mediaId, caption = '') {
+  if (!assertCreds()) return Promise.resolve(false);
+  const url = `${GRAPH_BASE}/${PHONE_ID}/messages`;
+  const payload = {
+    messaging_product: 'whatsapp',
+    to,
+    type: 'image',
+    image: { id: mediaId, caption }
+  };
+  if (config.DEBUG_LOGS) console.log('[WA -> image]', to, caption, mediaId);
+  return enqueue(() => postJSON(url, payload));
+}
 /**
  * Envía documento (PDF) previamente subido (por mediaId)
  * @param {string} to

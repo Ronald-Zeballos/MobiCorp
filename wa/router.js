@@ -12,13 +12,15 @@ import {
   btnsHectareas, btnsCampana, btnCotizar, summaryText
 } from '../core/flow.js';
 import {
-  waSendText, waSendButtons, waUploadMediaFromFile, waSendDocument
+  waSendText, waSendButtons, waUploadMediaFromFile, waSendDocument, waSendImage
 } from './send.js';
 import { parseCartFromText } from './parse.js';
 import { buildQuote } from '../src/quote.js';
 import { sheetsAppendFromSession } from '../src/sheets.js';
+import { loadCatalog, searchProductByText, getImagePathForName } from '../core/catalog.js';
 
 const router = express.Router();
+const catalog = loadCatalog();
 
 // ------- Idempotencia (TTL 5 min) -------
 const processed = new Map();
@@ -89,7 +91,13 @@ function applyActionToSession(s, a) {
       break;
     }
     case 'set_campana': s.campana = a.value; break;
-    // add_cart_items lo manejamos afuera con parseCartFromText
+    case 'add_item': {
+      const { qty, name } = a.value || {};
+      if (!name) break;
+      s.items = s.items || [];
+      s.items.push({ name, qty: Number(qty) || 1, price: null });
+      break;
+    }
   }
 }
 
@@ -124,14 +132,15 @@ router.post('/webhook', async (req, res) => {
     let s = loadSession(fromId);
     s.lastWamid = wamid;
     s.stage = s.stage || 'discovery';
+    s.items = s.items || [];
 
     // Pausa por asesor humano
     if (s.pausedUntil && Date.now() < s.pausedUntil) {
       if (/bot|continuar|reanudar/i.test(msg?.text?.body || '')) {
         s.pausedUntil = 0;
-        await waSendText(fromId, '🤖 He vuelto. Continuemos con tu solicitud.');
+        await waSendText(fromId, '🤖 ¡Aquí estoy de vuelta! Sigamos con tu cotización.');
       } else {
-        await waSendText(fromId, '🧑‍💼 Derivado a asesor. Escribe "continuar" para volver con el bot.');
+        await waSendText(fromId, '🧑‍💼 Te derivé con un asesor. Escribí "continuar" para volver conmigo.');
         saveSession(fromId, s);
         return res.sendStatus(200);
       }
@@ -149,9 +158,29 @@ router.post('/webhook', async (req, res) => {
       s.userLocation = { lat: msg.location?.latitude, lng: msg.location?.longitude };
       await waSendText(fromId, '📍 ¡Gracias! Guardé tu ubicación para la cotización.');
     }
+
+    // (NUEVO) Imagen: intentar reconocer por caption contra catálogo
+    if (type === 'image') {
+      const caption = msg.image?.caption || '';
+      if (caption) {
+        const found = searchProductByText(catalog, caption);
+        if (found) {
+          s.items.push({ name: found.name, qty: 1, price: null });
+          await waSendText(fromId, `🖼️ Perfecto, identifiqué *${found.name}*. Lo agrego a tu cotización.`);
+          // opcional: reenviar la misma imagen de nuestro catálogo para confirmar
+          const mediaId = await waUploadMediaFromFile(found.file, 'image/jpeg', `${found.name}.jpg`);
+          if (mediaId) await waSendImage(fromId, mediaId, `Confirmación: ${found.name}`);
+        } else {
+          await waSendText(fromId, 'Recibí la imagen. ¿Me confirmás el nombre del producto para agregarlo a la cotización?');
+        }
+      } else {
+        await waSendText(fromId, 'Recibí la imagen. Si me escribís el nombre del producto, lo agrego a tu cotización 😉');
+      }
+    }
+
     if (config.DEBUG_LOGS) console.log('[IN <-]', type, incomingText);
 
-    // 0) Atajos globales inmediatos
+    // Atajos utilitarios inmediatos
     if (wantsCatalog(incomingText)) {
       await waSendText(fromId, `🛒 Catálogo: ${config.CATALOG_URL || 'No disponible'}`);
     }
@@ -164,7 +193,7 @@ router.post('/webhook', async (req, res) => {
     }
     if (wantsHuman(incomingText)) {
       s.pausedUntil = Date.now() + 4 * 60 * 60 * 1000; // 4h
-      await waSendText(fromId, '🧑‍💼 Te conectamos con un asesor. El bot se pausará por 4 horas.');
+      await waSendText(fromId, '🧑‍💼 Te conecto con un asesor. Pauso el bot por 4 horas. Para volver escribí "continuar".');
       saveSession(fromId, s);
       return res.sendStatus(200);
     }
@@ -175,20 +204,20 @@ router.post('/webhook', async (req, res) => {
       return res.sendStatus(200);
     }
 
-    // 1) Carrito pegado (atajo a checkout)
+    // Carrito pegado (texto con viñetas)
     if (type === 'text' && !/dep_|sub_|crop_|ha_|camp_|do_quote/.test(incomingText)) {
       const cart = parseCartFromText(incomingText);
       if (cart?.items?.length) {
-        s.items = cart.items;
+        s.items = s.items.concat(cart.items);
         s.stage = 'checkout';
       }
     }
 
-    // 2) IA suave: decidir acciones
+    // IA suave: acciones
     const actions = await aiDecide(incomingText, s);
     for (const a of actions) applyActionToSession(s, a);
 
-    // 3) Respuestas utilitarias (ya priorizadas arriba, pero por si vinieron por IA)
+    // Acciones utilitarias (por IA)
     if (actions.some(a => a.action === 'want_catalog')) {
       await waSendText(fromId, `🛒 Catálogo: ${config.CATALOG_URL || 'No disponible'}`);
     }
@@ -201,7 +230,7 @@ router.post('/webhook', async (req, res) => {
     }
     if (actions.some(a => a.action === 'want_human')) {
       s.pausedUntil = Date.now() + 4 * 60 * 60 * 1000;
-      await waSendText(fromId, '🧑‍💼 Te conectamos con un asesor. El bot se pausará por 4 horas.');
+      await waSendText(fromId, '🧑‍💼 Te conecto con un asesor y pauso el bot por 4 horas. Para volver conmigo, escribí "continuar".');
       saveSession(fromId, s);
       return res.sendStatus(200);
     }
@@ -212,7 +241,30 @@ router.post('/webhook', async (req, res) => {
       return res.sendStatus(200);
     }
 
-    // 4) ¿Listo para cotizar?
+    // Disponibilidad por texto (consultar catálogo)
+    if (actions.some(a => a.action === 'want_availability')) {
+      const query = actions.find(a => a.action === 'want_availability')?.value || '';
+      const found = searchProductByText(catalog, query);
+      if (found) {
+        s.items.push({ name: found.name, qty: 1, price: null });
+        await waSendText(fromId, `Sí, contamos con *${found.name}*. Lo agrego a tu cotización 👌`);
+        const mediaId = await waUploadMediaFromFile(found.file, 'image/jpeg', `${found.name}.jpg`);
+        if (mediaId) await waSendImage(fromId, mediaId, found.name);
+      } else {
+        await waSendText(fromId, 'Podría estar con otro nombre. ¿Me pasás cómo figura el producto? O mandá una foto :)');
+      }
+    }
+
+    // Envíos / Pago (responder breve y reencarrilar)
+    if (actions.some(a => a.action === 'want_shipping')) {
+      await waSendText(fromId, '🚚 Sí, hacemos envíos. Para estimar costo y plazo, ¿en qué *Departamento* estás?');
+      await waSendButtons(fromId, 'Elegí tu *Departamento*:', btnsDepartamento());
+    }
+    if (actions.some(a => a.action === 'want_payment')) {
+      await waSendText(fromId, '💳 Aceptamos efectivo, QR y transferencia. ¿Querés que avance con tu cotización?');
+    }
+
+    // ¿Listo para cotizar?
     const ready = hasEnoughForQuote(s) || actions.some(a => a.action === 'want_quote') || wantsPrice(incomingText);
     if (ready) {
       s.stage = 'checkout';
@@ -222,15 +274,30 @@ router.post('/webhook', async (req, res) => {
       return res.sendStatus(200);
     }
 
-    // 5) Si falta algo, pedí SOLO lo que falta (flujo abierto)
+    // Si falta algo, pedir SOLO lo faltante
     const missing = nextMissingSlot(s);
     if (missing) {
+      // tono amable y vendedor
+      switch (missing) {
+        case 'departamento':
+          await waSendText(fromId, 'Para darte el mejor precio con envío, decime tu *Departamento* 😊');
+          break;
+        case 'hectareas':
+          await waSendText(fromId, 'Anotá cuántas *Hectáreas* trabajás. Podés escribir el número.');
+          break;
+        default:
+          // cae en askForSlot
+          break;
+      }
       await askForSlot(fromId, missing);
     } else {
-      // Smalltalk / sin cambios: reencarrilar amablemente
       if (actions.some(a => a.action === 'smalltalk')) {
-        await waSendText(fromId, '🙂 Te escucho. Si querés, puedo ir preparando tu cotización. ¿Definimos *Campaña*?');
-        await waSendButtons(fromId, 'Elegí *Campaña*:', btnsCampana());
+        await waSendText(fromId, '🙂 Te leo. Si querés, ya te preparo el PDF. ¿Vamos con *Campaña* o directo a *Cotizar*?');
+        await waSendButtons(fromId, 'Elegí *Campaña* o Cotizar:', [
+          { id: 'camp_verano', title: 'Verano' },
+          { id: 'camp_invierno', title: 'Invierno' },
+          { id: 'do_quote', title: '🧾 Cotizar' }
+        ]);
       }
     }
 
