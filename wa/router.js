@@ -24,7 +24,9 @@ import { getAdvice } from '../core/faq.js';
 const router = express.Router();
 const catalog = loadCatalog();
 
-// ------- Idempotencia (TTL 5 min) -------
+// =========================
+// Idempotencia (TTL 5 min)
+// =========================
 const processed = new Map();
 const TTL = 5 * 60 * 1000;
 function seen(wamid) {
@@ -35,14 +37,36 @@ function seen(wamid) {
   return false;
 }
 
-// ------- Anti-bucle & navegación -------
+// ===============
+// Utilidades
+// ===============
+const normalize = (s = '') =>
+  s.normalize('NFD').replace(/\p{Diacritic}+/gu, '').toLowerCase().trim();
+
 function isMenuCommand(t = '') {
   return /\b(volver|menu|menú|inicio|principal)\b/i.test(t || '');
 }
+
+function exitModes(s) {
+  s.mode = null;
+}
+
+// Detectar cultivo por texto libre
+function detectCropFromText(text) {
+  const n = normalize(text);
+  if (/\b(soja|soya)\b/.test(n)) return 'Soya';
+  if (/\b(maiz|maiz|maíz)\b/.test(n)) return 'Maíz';
+  if (/\b(trigo)\b/.test(n)) return 'Trigo';
+  if (/\b(arroz)\b/.test(n)) return 'Arroz';
+  if (/\b(girasol)\b/.test(n)) return 'Girasol';
+  return null;
+}
+
 function goHome(to, s) {
   exitModes(s);
   s.awaitingSlot = null;
   s.awaitingAt = 0;
+  s.slotRetries = {}; // reset
   waSendText(
     to,
     '🏠 Volvimos al menú principal. Decime si querés *Cotizar*, ver *Catálogo* o hacer *Preguntas/Dudas*.'
@@ -54,26 +78,17 @@ function goHome(to, s) {
     { id: 'btn_human', title: 'Hablar con asesor' }
   ]);
 }
-function shouldAskSlot(s, slot) {
-  const now = Date.now();
-  if (s.awaitingSlot === slot && s.awaitingAt && (now - s.awaitingAt) < 45000) {
-    return false; // ya se pidió hace menos de 45s
-  }
-  s.awaitingSlot = slot;
-  s.awaitingAt = now;
-  return true;
-}
-function exitModes(s) {
-  s.mode = null; // salir de FAQ/otros modos conversacionales
-}
 
-// ------- Orquestación (flujo abierto) -------
+// ================================
+// Orquestación (flujo conversado)
+// ================================
 function hasEnoughForQuote(s) {
   const base = s.departamento && s.cultivo && (s.hectareas !== null && s.hectareas !== undefined) && s.campana;
   const subOk = (s.departamento === 'Santa Cruz') ? !!(s.subzona) : true;
   const cartOk = s.items && s.items.length > 0;
   return (base && subOk) || (cartOk && s.departamento);
 }
+
 function nextMissingSlot(s) {
   if (!s.cultivo) return 'cultivo';
   if (s.hectareas === null || s.hectareas === undefined) return 'hectareas';
@@ -82,28 +97,51 @@ function nextMissingSlot(s) {
   if (s.departamento === 'Santa Cruz' && !s.subzona) return 'subzona';
   return null; // nombre al final
 }
+
+// cool-down y contadores para evitar loops
+function shouldAskSlot(s, slot) {
+  s.slotRetries = s.slotRetries || {};
+  const now = Date.now();
+  if (s.awaitingSlot === slot && s.awaitingAt && (now - s.awaitingAt) < 20000) {
+    return false; // menos de 20s desde el último pedido del mismo slot
+  }
+  s.awaitingSlot = slot;
+  s.awaitingAt = now;
+  s.slotRetries[slot] = s.slotRetries[slot] || 0;
+  return true;
+}
+function bumpRetryAndMaybeOfferMenu(to, s, slot) {
+  s.slotRetries = s.slotRetries || {};
+  s.slotRetries[slot] = (s.slotRetries[slot] || 0) + 1;
+  // Tras 2 intentos, ofrecer menú en vez de insistir:
+  if (s.slotRetries[slot] >= 2) {
+    waSendText(to, '🙂 Si preferís, escribí *volver* para regresar al menú, o elegí una opción debajo:');
+    return goHome(to, s);
+  }
+  return null;
+}
+
 async function askForSlot(to, slot, s) {
-  if (!shouldAskSlot(s, slot)) return; // evitar loop
+  if (!shouldAskSlot(s, slot)) return; // evitar spam
+  s.hinted = s.hinted || {};
+  const hint = s.hinted[slot] ? '' : '\nSi te equivocaste, escribí *volver* para ir al menú.';
+  s.hinted[slot] = true;
+
   switch (slot) {
     case 'cultivo':
-      await waSendButtons(to, '¿Para qué *cultivo* es? Elegí una opción:', btnsCultivos());
-      await waSendText(to, 'Si te equivocaste, escribí *volver* para ir al menú principal.');
-      break;
+      return waSendButtons(to, `¿Para qué *cultivo* es? Elegí una opción:${hint}`, btnsCultivos());
     case 'hectareas':
-      await waSendButtons(to, '¿Cuántas *hectáreas* vas a trabajar?', btnsHectareas());
-      await waSendText(to, 'También podés escribir el número (ej: 120). Escribí *volver* para el menú.');
-      break;
+      await waSendButtons(to, `¿Cuántas *hectáreas* vas a trabajar?${hint}`, btnsHectareas());
+      return waSendText(to, 'También podés escribir el número (ej: 120).');
     case 'campana':
-      await waSendButtons(to, '¿Para qué *campaña*?', btnsCampana());
-      break;
+      return waSendButtons(to, `¿Para qué *campaña*?${hint}`, btnsCampana());
     case 'departamento':
-      await waSendButtons(to, '¿En qué *Departamento* estás?', btnsDepartamento());
-      break;
+      return waSendButtons(to, `¿En qué *Departamento* estás?${hint}`, btnsDepartamento());
     case 'subzona':
-      await waSendButtons(to, 'Seleccioná tu *Subzona* en Santa Cruz:', btnsSubzonaSCZ());
-      break;
+      return waSendButtons(to, `Seleccioná tu *Subzona* en Santa Cruz:${hint}`, btnsSubzonaSCZ());
   }
 }
+
 function applyActionToSession(s, a) {
   switch (a.action) {
     case 'set_name':
@@ -138,7 +176,9 @@ function applyActionToSession(s, a) {
   }
 }
 
-// ------- GET /wa/webhook (verify) -------
+// ===========================
+// GET /wa/webhook (verify)
+// ===========================
 router.get('/webhook', (req, res) => {
   const mode = req.query['hub.mode'];
   const token = req.query['hub.verify_token'];
@@ -150,7 +190,9 @@ router.get('/webhook', (req, res) => {
   return res.sendStatus(403);
 });
 
-// ------- POST /wa/webhook (messages) -------
+// ============================
+// POST /wa/webhook (messages)
+// ============================
 router.post('/webhook', async (req, res) => {
   try {
     const entry = req.body?.entry?.[0];
@@ -183,14 +225,14 @@ router.post('/webhook', async (req, res) => {
       }
     }
 
-    // -------- SALUDO HUMANO (solo 1 vez) --------
+    // Saludo
     if (!s.greeted) {
       s.greeted = true;
       await waSendText(
         fromId,
         '👋 ¡Bienvenido/a a *NewChem Agroquímicos*! Contame, ¿qué necesitás hoy?\n' +
         'Podés escribirme el producto, pegar tu lista, o mandarme una foto con el nombre. ' +
-        'Si en cualquier momento querés regresar, escribí *volver*.'
+        'Si querés regresar al menú, escribí *volver*.'
       );
       await waSendButtons(fromId, 'Puedo ayudarte con:', [
         { id: 'btn_quote', title: '🧾 Cotizar' },
@@ -216,14 +258,14 @@ router.post('/webhook', async (req, res) => {
     }
     if (config.DEBUG_LOGS) console.log('[IN <-]', type, incomingText);
 
-    // Comando "volver" al menú
+    // Comando menú
     if (isMenuCommand(incomingText)) {
       await goHome(fromId, s);
       saveSession(fromId, s);
       return res.sendStatus(200);
     }
 
-    // -------- Botones de bienvenida --------
+    // Botones
     if (incomingText === 'btn_catalog') {
       exitModes(s);
       await waSendText(fromId, `🛒 Catálogo: ${config.CATALOG_URL || 'No disponible'}`);
@@ -234,7 +276,7 @@ router.post('/webhook', async (req, res) => {
     if (incomingText === 'btn_human') {
       s.pausedUntil = Date.now() + 4 * 60 * 60 * 1000;
       await waSendText(fromId, '🧑‍💼 Te conecto con un asesor ahora mismo.');
-      await waSendText(fromId, '📞 Contacto directo: +591 65900645\n👉 https://wa.me/59165900645');
+      await waSendText(fromId, '📞 +591 65900645\n👉 https://wa.me/59165900645');
       await waSendText(fromId, 'Para volver conmigo en cualquier momento, escribí *continuar*.');
       saveSession(fromId, s);
       return res.sendStatus(200);
@@ -257,7 +299,7 @@ router.post('/webhook', async (req, res) => {
       return res.sendStatus(200);
     }
 
-    // -------- Manejo explícito de botones dep_/sub_ --------
+    // Dep/Sub
     if (incomingText?.startsWith?.('dep_')) {
       const idx = Number(incomingText.split('_')[1]);
       const dep = DEPARTAMENTOS[idx];
@@ -287,7 +329,7 @@ router.post('/webhook', async (req, res) => {
       }
     }
 
-    // --- Botones de cultivo / hectáreas / campaña ---
+    // Cultivo/HA/Campaña
     if (incomingText?.startsWith?.('crop_')) {
       const id = incomingText.split('_')[1] || '';
       const map = { soya: 'Soya', maiz: 'Maíz', trigo: 'Trigo', arroz: 'Arroz', girasol: 'Girasol', otro: 'Otro' };
@@ -328,7 +370,7 @@ router.post('/webhook', async (req, res) => {
       }
     }
 
-    // --- Agregar sugerencias desde FAQ: add_<slug> ---
+    // add_ desde FAQ
     if (incomingText?.startsWith?.('add_')) {
       const slug = incomingText.slice(4);
       const p = findProductBySlug(catalog, slug);
@@ -350,7 +392,7 @@ router.post('/webhook', async (req, res) => {
       }
     }
 
-    // -------- Imagen: reconocer por caption contra catálogo --------
+    // Imagen → reconocer por caption
     if (type === 'image') {
       const caption = msg.image?.caption || '';
       if (config.DEBUG_LOGS) console.log('[IMG] caption:', caption);
@@ -364,13 +406,13 @@ router.post('/webhook', async (req, res) => {
           await waSendText(fromId, 'Recibí la imagen. Para reconocer el producto, escribime el *nombre* tal como figura en el envase (o en nuestro catálogo).');
         }
       } else {
-        await waSendText(fromId, 'Recibí la imagen. Escribime el *nombre del producto* en un mensaje y lo agrego a la cotización 😉');
+        await waSendText(fromId, 'Recibí la imagen. Escribime el *nombre del producto* y lo agrego 😉');
       }
       saveSession(fromId, s);
       return res.sendStatus(200);
     }
 
-    // -------- Atajos utilitarios globales --------
+    // Atajos globales
     if (wantsCatalog(incomingText)) {
       await waSendText(fromId, `🛒 Catálogo: ${config.CATALOG_URL || 'No disponible'}`);
       await waSendText(fromId, 'Decime qué producto te interesa y te lo cotizo 😉\nEscribí *volver* para regresar al menú.');
@@ -401,7 +443,7 @@ router.post('/webhook', async (req, res) => {
       return res.sendStatus(200);
     }
 
-    // -------- Carrito pegado (texto con viñetas) --------
+    // Carrito pegado
     if (type === 'text' && !/^(dep_|sub_|crop_|ha_|camp_|do_quote|add_)/.test(incomingText)) {
       const cart = parseCartFromText(incomingText);
       if (cart?.items?.length) {
@@ -410,11 +452,10 @@ router.post('/webhook', async (req, res) => {
       }
     }
 
-    // -------- IA suave: acciones --------
+    // IA suave
     const actions = await aiDecide(incomingText, s);
     for (const a of actions) applyActionToSession(s, a);
 
-    // Utilitario por IA (con retorno para evitar duplicaciones)
     if (actions.some(a => a.action === 'want_catalog')) {
       await waSendText(fromId, `🛒 Catálogo: ${config.CATALOG_URL || 'No disponible'}`);
       await waSendText(fromId, 'Decime qué producto te interesa y te lo cotizo 😉');
@@ -445,7 +486,7 @@ router.post('/webhook', async (req, res) => {
       return res.sendStatus(200);
     }
 
-    // Preguntas / Dudas (FAQ) — sólo con TEXTO del usuario
+    // FAQ (solo si el usuario envía TEXTO)
     if ((s.mode === 'faq' && type === 'text') || actions.some(a => a.action === 'want_advice')) {
       const raw = actions.find(a => a.action === 'want_advice')?.value || incomingText || '';
       const adv = getAdvice(raw, catalog);
@@ -459,13 +500,13 @@ router.post('/webhook', async (req, res) => {
       } else {
         await waSendButtons(fromId, '¿Te ayudo a elegir por *cultivo*?', btnsCultivos());
       }
-      // Si fue texto, seguimos en FAQ; si no, salimos para evitar loops
+      // si no fue texto, salimos para evitar loops; si fue texto, seguimos en FAQ
       if (type !== 'text') exitModes(s);
       saveSession(fromId, s);
       return res.sendStatus(200);
     }
 
-    // Disponibilidad por texto (consultar catálogo)
+    // Disponibilidad por texto
     if (actions.some(a => a.action === 'want_availability')) {
       const query = actions.find(a => a.action === 'want_availability')?.value || '';
       const found = searchProductByText(catalog, query);
@@ -477,7 +518,7 @@ router.post('/webhook', async (req, res) => {
       }
     }
 
-    // Envíos / Pago (responder breve y reencarrilar)
+    // Envíos / Pago
     if (actions.some(a => a.action === 'want_shipping')) {
       await waSendText(fromId, '🚚 Sí, hacemos envíos. Para estimar costo y plazo, ¿en qué *Departamento* estás?');
       await waSendButtons(fromId, 'Elegí tu *Departamento*:', btnsDepartamento());
@@ -488,7 +529,7 @@ router.post('/webhook', async (req, res) => {
       await waSendText(fromId, '💳 Aceptamos efectivo, QR y transferencia. ¿Querés que avance con tu cotización?');
     }
 
-    // -------- ¿Listo para cotizar? --------
+    // ¿Listo para cotizar?
     const ready = hasEnoughForQuote(s) || actions.some(a => a.action === 'want_quote') || wantsPrice(incomingText);
     if (ready) {
       s.stage = 'checkout';
@@ -501,24 +542,36 @@ router.post('/webhook', async (req, res) => {
       return res.sendStatus(200);
     }
 
-    // -------- Falta algo: pedir SOLO lo que falta --------
+    // Si falta algo, intentar cubrir por texto libre (especial cultivo)
     const missing = nextMissingSlot(s);
-    if (missing) {
-      const friendly = {
-        cultivo: 'Decime el *cultivo* y te paso opciones 😉',
-        hectareas: '¿Cuántas *hectáreas* vas a trabajar? Podés escribir el número.',
-        campana: '¿Para qué *campaña*? [Verano] [Invierno]',
-        departamento: 'Para estimar envío y condiciones, ¿en qué *Departamento* estás?',
-        subzona: 'Elegí tu *Subzona* de Santa Cruz:'
-      }[missing];
-      if (friendly) await waSendText(fromId, friendly);
-      await askForSlot(fromId, missing, s);
+    if (type === 'text' && missing === 'cultivo' && !/^btn_/.test(incomingText)) {
+      const guess = detectCropFromText(incomingText);
+      if (guess) {
+        s.cultivo = guess;
+      }
+    }
+
+    // Falta algo: pedir SOLO lo que falta, con anti-loop
+    if (nextMissingSlot(s)) {
+      const slot = nextMissingSlot(s);
+      if (type === 'text' && !detectCropFromText(incomingText) && slot === 'cultivo') {
+        // off-topic simpático
+        const math = incomingText.match(/^\s*(\d+)\s*\+\s*(\d+)\s*$/);
+        if (math) {
+          const a = Number(math[1]), b = Number(math[2]);
+          await waSendText(fromId, `😄 Eso es *${a + b}*. Ahora, para ayudarte mejor ¿te muestro opciones por *cultivo*?`);
+        } else {
+          await waSendText(fromId, '🙂 Te leo. Para afinar la recomendación, necesito el *cultivo*.');
+        }
+      }
+      await askForSlot(fromId, slot, s);
+      bumpRetryAndMaybeOfferMenu(fromId, s, slot);
       saveSession(fromId, s);
       return res.sendStatus(200);
     } else {
-      // Smalltalk / sin cambios: reencarrilar amablemente
+      // Smalltalk sin cambios → reencarrilar
       if (actions.some(a => a.action === 'smalltalk')) {
-        await waSendText(fromId, '🙂 Te leo. Si querés, ya te preparo el PDF. ¿Vamos con *Campaña* o directo a *Cotizar*? Escribí *volver* para el menú.');
+        await waSendText(fromId, '😉 Todo listo por aquí. ¿Avanzo con el PDF o querés ajustar *Campaña*? Escribí *volver* para el menú.');
         await waSendButtons(fromId, 'Elegí *Campaña* o Cotizar:', [
           { id: 'camp_verano', title: 'Verano' },
           { id: 'camp_invierno', title: 'Invierno' },
@@ -529,7 +582,7 @@ router.post('/webhook', async (req, res) => {
       }
     }
 
-    // -------- Cierre de venta: generar PDF --------
+    // Cierre: generar PDF
     if (s.stage === 'checkout' && (incomingText === 'do_quote' || wantsPrice(incomingText))) {
       if (!s.name) {
         s.stage = 'checkout_wait_name';
@@ -550,7 +603,7 @@ router.post('/webhook', async (req, res) => {
       return res.sendStatus(200);
     }
 
-    // Si estamos esperando nombre y el cliente lo envía → cotizar
+    // Nombre → cotizar
     if (s.stage === 'checkout_wait_name' && looksLikeFullName(incomingText)) {
       s.name = incomingText.trim();
       const { path: pdfPath, filename } = await buildQuote(s, fromId);
