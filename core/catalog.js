@@ -6,6 +6,8 @@ import { fileURLToPath } from 'url';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.join(__dirname, '..');
 const IMG_DIR = path.join(ROOT, 'images');
+const DATA_DIR = path.join(ROOT, 'data');
+const PRICES_FILE = path.join(DATA_DIR, 'prices.json');
 
 export const norm = (s = '') =>
   s.toString().trim().toLowerCase()
@@ -15,9 +17,17 @@ export function slugify(name) {
   return norm(name).replace(/[^a-z0-9]+/g, ' ').trim().replace(/\s+/g, '-');
 }
 
+function loadPrices() {
+  try {
+    if (!fs.existsSync(PRICES_FILE)) return {};
+    const raw = fs.readFileSync(PRICES_FILE, 'utf8');
+    return JSON.parse(raw) || {};
+  } catch { return {}; }
+}
+
 /** Carga el catálogo desde ./images (cada archivo = un producto) */
 export function loadCatalog() {
-  if (!fs.existsSync(IMG_DIR)) return { products: [], bySlug: new Map() };
+  if (!fs.existsSync(IMG_DIR)) return { products: [], bySlug: new Map(), prices: {} };
   const files = fs.readdirSync(IMG_DIR).filter(f => /\.(png|jpe?g|webp)$/i.test(f));
 
   const products = files.map(f => {
@@ -28,7 +38,8 @@ export function loadCatalog() {
   });
 
   const bySlug = new Map(products.map(p => [p.slug, p]));
-  return { products, bySlug };
+  const prices = loadPrices(); // { slug: number }
+  return { products, bySlug, prices };
 }
 
 function scoreMatch(base, q) {
@@ -58,4 +69,9 @@ export function getImagePathForName(catalog, name = '') {
 
 export function findProductBySlug(catalog, slug = '') {
   return catalog.bySlug?.get(slug) || null;
+}
+
+export function getPriceBySlug(catalog, slug) {
+  const v = catalog.prices?.[slug];
+  return (typeof v === 'number' && Number.isFinite(v)) ? v : null;
 }

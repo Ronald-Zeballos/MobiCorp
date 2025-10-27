@@ -5,14 +5,14 @@ import {
   wantsCatalog, wantsHuman, wantsLocation, wantsClose, wantsPrice,
   looksLikeFullName, detectDepartamento, detectSubzona, parseHectareas, CROP_OPTIONS
 } from './intents.js';
-import { searchProductByText, norm as normCatalog } from './catalog.js';
+import { searchProductByText } from './catalog.js';
 
 const norm = (s='') => s.toString().trim().toLowerCase()
   .normalize('NFD').replace(/\p{Diacritic}/gu, '');
 
 const openai = config.OPENAI_API_KEY ? new OpenAI({ apiKey: config.OPENAI_API_KEY }) : null;
 
-// --------- Cultivo ----------
+// ---- cultivo
 function detectCultivo(text) {
   const t = norm(text);
   for (const c of CROP_OPTIONS) {
@@ -24,7 +24,7 @@ function detectCultivo(text) {
   return null;
 }
 
-// --------- Intents rápidas ----------
+// ---- intents rápidas
 function wantsQuote(text) {
   const t = norm(text);
   return /(cotiza|cotizame|presupuesto|pdf|precio|cuanto sale|cuánto sale)/.test(t);
@@ -52,9 +52,8 @@ function addItemIntent(text) {
   return null;
 }
 
-// --------- NLU estructurada para slots (texto libre) ----------
+// ---- slots por texto libre (heurístico)
 export async function aiExtractFields(text = '', s = {}) {
-  // Heurística local sin depender siempre de LLM; rápida y barata
   const out = {};
   if (looksLikeFullName(text)) out.nombre = text.trim();
 
@@ -87,9 +86,7 @@ export function quickIntent(text = '') {
   return null;
 }
 
-export function shouldCloseNow(s) {
-  return hasEnoughForQuoteLike(s);
-}
+export function shouldCloseNow(s) { return hasEnoughForQuoteLike(s); }
 
 function hasEnoughForQuoteLike(s) {
   const base = s.departamento && s.cultivo && (s.hectareas !== null && s.hectareas !== undefined) && s.campana;
@@ -98,34 +95,26 @@ function hasEnoughForQuoteLike(s) {
   return (base && subOk) || (cartOk && s.departamento);
 }
 
-// --------- Visión: identifica producto desde imagen (Buffer) ----------
-/**
- * aiIdentifyProductFromPhoto(buffer, catalog)
- * - Devuelve { hit: true, product } si coincide con catálogo
- * - Devuelve { hit: false, label, category } si no vendible (p.ej. "Coca-Cola")
- */
+// ---- visión con OpenAI (buffer de imagen)
 export async function aiIdentifyProductFromPhoto(buffer, catalog) {
   if (!openai) return { hit: false, reason: 'no_openai' };
   try {
     const b64 = buffer.toString('base64');
     const prompt = `
-Eres un experto en agroquímicos de Bolivia. Analiza la etiqueta del producto en la foto.
-1) Extrae el NOMBRE COMERCIAL visible en la etiqueta (texto grande de marca).
-2) Si NO es agroquímico (p. ej., bebidas, comida, objetos), indícalo.
-3) Responde SOLO en JSON con:
+Eres experto en agroquímicos en Bolivia. Analiza la etiqueta.
+Devuelve SOLO JSON:
 {
   "is_agro": boolean,
-  "label": "texto detectado principal",
+  "label": "texto principal de la etiqueta",
   "notes": "breve",
   "category": "agroquimico|bebida|alimento|otro"
-}
-No incluyas texto adicional.`;
+}`;
 
     const resp = await openai.chat.completions.create({
       model: 'gpt-4o-mini',
       temperature: 0.2,
       messages: [
-        { role: 'system', content: 'Eres un asistente que responde exclusivamente en JSON válido.' },
+        { role: 'system', content: 'Responde exclusivamente JSON válido.' },
         {
           role: 'user',
           content: [
@@ -137,26 +126,22 @@ No incluyas texto adicional.`;
     });
 
     const raw = resp.choices?.[0]?.message?.content?.trim() || '{}';
-    let parsed;
-    try { parsed = JSON.parse(raw); } catch { parsed = { is_agro: false, label: '' }; }
+    let parsed; try { parsed = JSON.parse(raw); } catch { parsed = {}; }
 
     const label = String(parsed.label || '').trim();
     const isAgro = !!parsed.is_agro;
-    const category = String(parsed.category || '').trim().toLowerCase();
+    const category = String(parsed.category || '').toLowerCase() || 'otro';
 
-    if (!label) return { hit: false, label: '', category: category || 'desconocido' };
-
+    if (!label) return { hit: false, label: '', category };
     const match = searchProductByText(catalog, label);
-    if (isAgro && match) {
-      return { hit: true, product: match, label, category: 'agroquimico' };
-    }
-    return { hit: false, label, category: category || 'otro' };
-  } catch (e) {
+    if (isAgro && match) return { hit: true, product: match, label, category: 'agroquimico' };
+    return { hit: false, label, category };
+  } catch {
     return { hit: false, reason: 'vision_error' };
   }
 }
 
-// --------- Decisor clásico (compat) ----------
+// ---- decisor clásico (compat)
 export async function aiDecide(message, session) {
   const actions = [];
   const t = message || '';
@@ -174,17 +159,11 @@ export async function aiDecide(message, session) {
   const add = addItemIntent(t);
   if (add) actions.push({ action: 'add_item', value: add });
 
-  // Slots
   if (looksLikeFullName(t)) actions.push({ action: 'set_name', value: t.trim() });
 
-  const dep = detectDepartamento(t);
-  if (dep) actions.push({ action: 'set_departamento', value: dep });
-
-  const sub = detectSubzona(t);
-  if (sub) actions.push({ action: 'set_subzona', value: sub });
-
-  const cult = detectCultivo(t);
-  if (cult) actions.push({ action: 'set_cultivo', value: cult });
+  const dep = detectDepartamento(t); if (dep) actions.push({ action: 'set_departamento', value: dep });
+  const sub = detectSubzona(t); if (sub) actions.push({ action: 'set_subzona', value: sub });
+  const cult = detectCultivo(t); if (cult) actions.push({ action: 'set_cultivo', value: cult });
 
   const ha = parseHectareas(t);
   if (Number.isFinite(ha) || ha) actions.push({ action: 'set_hectareas', value: ha });

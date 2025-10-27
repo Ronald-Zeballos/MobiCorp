@@ -1,26 +1,21 @@
-// core/session.js (ESM, exports nombrados)
+// core/session.js
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const ROOT = path.join(__dirname, '..');                     // /core -> raíz del repo
-const SESS_DIR = path.join(ROOT, 'data', 'tmp', 'sessions'); // ./data/tmp/sessions
-const TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 días
+const ROOT = path.join(__dirname, '..');
+const SESS_DIR = path.join(ROOT, 'data', 'tmp', 'sessions');
+const TTL_MS = 7 * 24 * 60 * 60 * 1000;
 
-function ensureDirs() {
-  fs.mkdirSync(SESS_DIR, { recursive: true });
-}
-
-function sessPath(id) {
-  return path.join(SESS_DIR, `${id}.json`);
-}
+function ensureDirs() { fs.mkdirSync(SESS_DIR, { recursive: true }); }
+function sessPath(id) { return path.join(SESS_DIR, `${id}.json`); }
 
 export function createDefault(id) {
   return {
     _id: id,
     _ts: Date.now(),
-    stage: 'discovery',        // discovery → product → checkout → closed
+    stage: 'discovery',
     pausedUntil: 0,
     greeted: false,
     profileName: null,
@@ -32,7 +27,7 @@ export function createDefault(id) {
     campana: null,
     items: [],
     lastWamid: null,
-    // Anti-loop / hints
+    // anti-loop / hints
     awaitingSlot: null,
     awaitingAt: 0,
     slotRetries: {},
