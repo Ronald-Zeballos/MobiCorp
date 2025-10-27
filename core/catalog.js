@@ -7,19 +7,18 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.join(__dirname, '..');
 const IMG_DIR = path.join(ROOT, 'images');
 
-const norm = (s = '') =>
+export const norm = (s = '') =>
   s.toString().trim().toLowerCase()
     .normalize('NFD').replace(/\p{Diacritic}/gu, '');
 
-function slugify(name) {
-  return norm(name).replace(/[^a-z0-9]+/g, ' ').trim().replace(/\s+/g, ' ');
+export function slugify(name) {
+  return norm(name).replace(/[^a-z0-9]+/g, ' ').trim().replace(/\s+/g, '-');
 }
 
 /** Carga el catálogo desde ./images (cada archivo = un producto) */
 export function loadCatalog() {
   if (!fs.existsSync(IMG_DIR)) return { products: [], bySlug: new Map() };
-  const files = fs.readdirSync(IMG_DIR)
-    .filter(f => /\.(png|jpe?g|webp)$/i.test(f));
+  const files = fs.readdirSync(IMG_DIR).filter(f => /\.(png|jpe?g|webp)$/i.test(f));
 
   const products = files.map(f => {
     const base = f.replace(/\.(png|jpe?g|webp)$/i, '');
@@ -42,11 +41,11 @@ function scoreMatch(base, q) {
 }
 
 export function searchProductByText(catalog, text = '') {
-  const q = slugify(text);
+  const q = norm(text).replace(/[^a-z0-9]+/g, ' ').trim();
   if (!q) return null;
   let best = null, bestScore = -1;
   for (const p of catalog.products) {
-    const score = scoreMatch(p.slug, q);
+    const score = scoreMatch(p.slug.replace(/-/g, ' '), q);
     if (score > bestScore) { best = p; bestScore = score; }
   }
   return bestScore > 0 ? best : null;
@@ -55,4 +54,8 @@ export function searchProductByText(catalog, text = '') {
 export function getImagePathForName(catalog, name = '') {
   const found = searchProductByText(catalog, name);
   return found ? found.file : null;
+}
+
+export function findProductBySlug(catalog, slug = '') {
+  return catalog.bySlug?.get(slug) || null;
 }

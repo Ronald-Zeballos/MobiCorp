@@ -33,6 +33,10 @@ function wantsPayment(text) {
   const t = norm(text);
   return /(pago|pagar|medios de pago|qr|transferencia|efectivo|tarjeta|factura)/.test(t);
 }
+function wantsAdvice(text) {
+  const t = norm(text);
+  return /(recomend|consej|que me recomend|que usar|que producto|plaga|maleza|herbicida|insecticida|fungicida|chinche|trips|roya|mancha)/.test(t);
+}
 function addItemIntent(text) {
   const t = norm(text);
   const m = t.match(/(agrega|agregame|suma|sumame|anade|añade)\s+(\d+)\s+(de\s+)?(.+)/);
@@ -44,12 +48,12 @@ export async function aiDecide(message, session) {
   const actions = [];
   const t = message || '';
 
-  // Atajos/utilidades
   if (wantsClose(t)) actions.push({ action: 'want_close' });
   if (wantsHuman(t)) actions.push({ action: 'want_human' });
   if (wantsCatalog(t)) actions.push({ action: 'want_catalog' });
   if (wantsLocation(t)) actions.push({ action: 'want_location' });
 
+  if (wantsAdvice(t)) actions.push({ action: 'want_advice', value: t });
   if (wantsAvailability(t)) actions.push({ action: 'want_availability', value: t });
   if (wantsShipping(t)) actions.push({ action: 'want_shipping' });
   if (wantsPayment(t)) actions.push({ action: 'want_payment' });
@@ -75,7 +79,6 @@ export async function aiDecide(message, session) {
   if (/camp(_|a)?_?verano|\bverano\b/i.test(t)) actions.push({ action: 'set_campana', value: 'Verano' });
   if (/camp(_|a)?_?invierno|\binvierno\b/i.test(t)) actions.push({ action: 'set_campana', value: 'Invierno' });
 
-  // Cierre
   if (wantsPrice(t) || wantsQuote(t)) actions.push({ action: 'want_quote' });
 
   if (actions.length === 0) actions.push({ action: 'smalltalk' });
