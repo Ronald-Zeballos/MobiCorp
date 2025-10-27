@@ -21,6 +21,9 @@ import { sheetsAppendFromSession } from '../src/sheets.js';
 import { loadCatalog, searchProductByText, findProductBySlug, slugify } from '../core/catalog.js';
 import { getAdvice } from '../core/faq.js';
 
+// === NUEVO: clientes persistentes (JSON) ===
+import { getClient, upsertClient } from '../core/clients.js';
+
 const router = express.Router();
 const catalog = loadCatalog();
 
@@ -47,15 +50,13 @@ function isMenuCommand(t = '') {
   return /\b(volver|menu|menú|inicio|principal)\b/i.test(t || '');
 }
 
-function exitModes(s) {
-  s.mode = null;
-}
+function exitModes(s) { s.mode = null; }
 
 // Detectar cultivo por texto libre
 function detectCropFromText(text) {
   const n = normalize(text);
   if (/\b(soja|soya)\b/.test(n)) return 'Soya';
-  if (/\b(maiz|maiz|maíz)\b/.test(n)) return 'Maíz';
+  if (/\b(maiz|maíz)\b/.test(n)) return 'Maíz';
   if (/\b(trigo)\b/.test(n)) return 'Trigo';
   if (/\b(arroz)\b/.test(n)) return 'Arroz';
   if (/\b(girasol)\b/.test(n)) return 'Girasol';
@@ -113,7 +114,7 @@ function shouldAskSlot(s, slot) {
 function bumpRetryAndMaybeOfferMenu(to, s, slot) {
   s.slotRetries = s.slotRetries || {};
   s.slotRetries[slot] = (s.slotRetries[slot] || 0) + 1;
-  // Tras 2 intentos, ofrecer menú en vez de insistir:
+  // Tras 2 intentos, ofrecer menú:
   if (s.slotRetries[slot] >= 2) {
     waSendText(to, '🙂 Si preferís, escribí *volver* para regresar al menú, o elegí una opción debajo:');
     return goHome(to, s);
@@ -212,6 +213,10 @@ router.post('/webhook', async (req, res) => {
     s.stage = s.stage || 'discovery';
     s.items = s.items || [];
 
+    // === NUEVO: recuperar cliente persistente para saludar por nombre
+    const cli = getClient(fromId);
+    if (cli?.name && !s.profileName) s.profileName = cli.name;
+
     // Pausa por asesor humano
     if (s.pausedUntil && Date.now() < s.pausedUntil) {
       const txt = msg?.text?.body || '';
@@ -225,12 +230,13 @@ router.post('/webhook', async (req, res) => {
       }
     }
 
-    // Saludo
+    // Saludo (con nombre si lo tenemos)
     if (!s.greeted) {
       s.greeted = true;
+      const nombre = s.name || s.profileName;
       await waSendText(
         fromId,
-        '👋 ¡Bienvenido/a a *NewChem Agroquímicos*! Contame, ¿qué necesitás hoy?\n' +
+        `👋 ¡Bienvenido/a ${nombre ? `*${nombre}* ` : ''}a *NewChem Agroquímicos*! Contame, ¿qué necesitás hoy?\n` +
         'Podés escribirme el producto, pegar tu lista, o mandarme una foto con el nombre. ' +
         'Si querés regresar al menú, escribí *volver*.'
       );
@@ -246,7 +252,7 @@ router.post('/webhook', async (req, res) => {
 
     // Normalizar entrada
     let incomingText = '';
-    if (type === 'text') incomingText = msg.text?.body || '';
+    if (type === 'text') incomingText = (msg.text?.body || '').trim();
     if (type === 'interactive') {
       const n = msg.interactive?.button_reply || msg.interactive?.list_reply;
       if (n?.id) incomingText = n.id;
@@ -362,8 +368,13 @@ router.post('/webhook', async (req, res) => {
           await waSendButtons(fromId, '¿En qué *Departamento* estás?', btnsDepartamento());
         } else {
           s.stage = 'checkout';
-          await waSendText(fromId, `${summaryText(s)}\n\n¿Generamos tu PDF de cotización?`);
-          await waSendButtons(fromId, '¿Listo para *Cotizar*?', btnCotizar());
+          // NUEVO: evitar duplicado de resumen en 30s
+          const now = Date.now();
+          if (!s.shownSummaryAt || (now - s.shownSummaryAt) > 30000) {
+            s.shownSummaryAt = now;
+            await waSendText(fromId, `${summaryText(s)}\n\n¿Generamos tu PDF de cotización?`);
+            await waSendButtons(fromId, '¿Listo para *Cotizar*?', btnCotizar());
+          }
         }
         saveSession(fromId, s);
         return res.sendStatus(200);
@@ -384,8 +395,12 @@ router.post('/webhook', async (req, res) => {
         else if (!s.campana) await waSendButtons(fromId, '¿Para qué *campaña*?', btnsCampana());
         else {
           s.stage = 'checkout';
-          await waSendText(fromId, `${summaryText(s)}\n\n¿Generamos tu PDF de cotización?`);
-          await waSendButtons(fromId, '¿Listo para *Cotizar*?', btnCotizar());
+          const now = Date.now();
+          if (!s.shownSummaryAt || (now - s.shownSummaryAt) > 30000) {
+            s.shownSummaryAt = now;
+            await waSendText(fromId, `${summaryText(s)}\n\n¿Generamos tu PDF de cotización?`);
+            await waSendButtons(fromId, '¿Listo para *Cotizar*?', btnCotizar());
+          }
         }
         saveSession(fromId, s);
         return res.sendStatus(200);
@@ -529,26 +544,33 @@ router.post('/webhook', async (req, res) => {
       await waSendText(fromId, '💳 Aceptamos efectivo, QR y transferencia. ¿Querés que avance con tu cotización?');
     }
 
+    // Empujoncito a dudas si hay desvío mientras pedimos slot
+    if (s.awaitingSlot && type === 'text' && !/^(dep_|sub_|crop_|ha_|camp_|do_quote|add_|volver|men[úu]|menu|principal)/i.test(incomingText)) {
+      await waSendText(fromId, 'Si preferís, podemos charlar en *Preguntas/Dudas*. Escribí *dudas* para entrar en ese modo, o decime lo que falta y seguimos 🙂');
+    }
+
     // ¿Listo para cotizar?
     const ready = hasEnoughForQuote(s) || actions.some(a => a.action === 'want_quote') || wantsPrice(incomingText);
     if (ready) {
       s.stage = 'checkout';
-      await waSendText(fromId,
-        `${summaryText(s)}\n\n` +
-        '🧠 Si querés ajustar algo, decime. Si está bien, generamos el PDF:'
-      );
-      await waSendButtons(fromId, '¿Listo para *Cotizar*?', btnCotizar());
+      const now = Date.now();
+      if (!s.shownSummaryAt || (now - s.shownSummaryAt) > 30000) {
+        s.shownSummaryAt = now;
+        await waSendText(fromId,
+          `${summaryText(s)}\n\n` +
+          '🧠 Si querés ajustar algo, decime. Si está bien, generamos el PDF:'
+        );
+        await waSendButtons(fromId, '¿Listo para *Cotizar*?', btnCotizar());
+      }
       saveSession(fromId, s);
       return res.sendStatus(200);
     }
 
-    // Si falta algo, intentar cubrir por texto libre (especial cultivo)
+    // Si falta algo, intentar cubrir por texto libre (cultivo)
     const missing = nextMissingSlot(s);
     if (type === 'text' && missing === 'cultivo' && !/^btn_/.test(incomingText)) {
       const guess = detectCropFromText(incomingText);
-      if (guess) {
-        s.cultivo = guess;
-      }
+      if (guess) { s.cultivo = guess; s.awaitingSlot = null; s.awaitingAt = 0; }
     }
 
     // Falta algo: pedir SOLO lo que falta, con anti-loop
@@ -598,6 +620,8 @@ router.post('/webhook', async (req, res) => {
         await waSendText(fromId, 'No pude subir el PDF a WhatsApp. Intentá de nuevo en un momento.');
       }
       try { await sheetsAppendFromSession(s, fromId, 'closed'); } catch {}
+      // NUEVO: persistir cliente
+      if (s.name) upsertClient(fromId, { name: s.name });
       s.stage = 'closed';
       saveSession(fromId, s);
       return res.sendStatus(200);
@@ -614,10 +638,15 @@ router.post('/webhook', async (req, res) => {
         await waSendText(fromId, 'No pude subir el PDF a WhatsApp. Intentá de nuevo en un momento.');
       }
       try { await sheetsAppendFromSession(s, fromId, 'closed'); } catch {}
+      // NUEVO: persistir cliente
+      upsertClient(fromId, { name: s.name });
       s.stage = 'closed';
       saveSession(fromId, s);
       return res.sendStatus(200);
     }
+
+    // Guardar "lastSeen" aunque no haya cierre
+    upsertClient(fromId, {});
 
     saveSession(fromId, s);
     res.sendStatus(200);
