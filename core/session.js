@@ -22,6 +22,8 @@ export function createDefault(id) {
     _ts: Date.now(),
     stage: 'discovery',        // discovery → product → checkout → closed
     pausedUntil: 0,
+    greeted: false,
+    profileName: null,
     name: null,
     departamento: null,
     subzona: null,
@@ -29,7 +31,16 @@ export function createDefault(id) {
     hectareas: null,
     campana: null,
     items: [],
-    lastWamid: null
+    lastWamid: null,
+    // Anti-loop / hints
+    awaitingSlot: null,
+    awaitingAt: 0,
+    slotRetries: {},
+    hinted: {},
+    // UI helpers
+    shownSummaryAt: 0,
+    mode: null,
+    meta: {}
   };
 }
 
@@ -41,7 +52,7 @@ export function loadSession(id) {
     const raw = fs.readFileSync(p, 'utf8');
     const json = JSON.parse(raw);
     if (Date.now() - (json._ts || 0) > TTL_MS) return createDefault(id);
-    return json;
+    return { ...createDefault(id), ...json };
   } catch {
     return createDefault(id);
   }

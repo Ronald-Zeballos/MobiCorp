@@ -131,3 +131,27 @@ export function waSendImage(to, mediaId, caption = '') {
   if (config.DEBUG_LOGS) console.log('[WA -> image]', to, caption, mediaId);
   return enqueue(() => postJSON(url, payload));
 }
+
+/** NUEVO: obtener URL y descargar media para visión IA */
+export async function waGetMediaUrl(mediaId) {
+  if (!assertCreds()) return null;
+  const metaUrl = `${GRAPH_BASE}/${mediaId}`;
+  const r = await fetch(metaUrl, { headers: { Authorization: `Bearer ${TOKEN}` }});
+  const txt = await r.text();
+  if (!r.ok) { console.error('[WA media meta ERROR]', r.status, txt); return null; }
+  try {
+    const j = JSON.parse(txt);
+    return j?.url || null;
+  } catch {
+    return null;
+  }
+}
+
+export async function waDownloadMedia(mediaId) {
+  const url = await waGetMediaUrl(mediaId);
+  if (!url) return null;
+  const r = await fetch(url, { headers: { Authorization: `Bearer ${TOKEN}` }});
+  if (!r.ok) { console.error('[WA media download ERROR]', r.status); return null; }
+  const buf = await r.arrayBuffer();
+  return Buffer.from(buf);
+}

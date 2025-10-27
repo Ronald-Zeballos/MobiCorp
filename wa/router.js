@@ -2,7 +2,7 @@
 import express from 'express';
 import { config } from '../env.js';
 import { loadSession, saveSession } from '../core/session.js';
-import { aiDecide } from '../core/ai.js';
+import { aiDecide, aiExtractFields, aiIdentifyProductFromPhoto, shouldCloseNow } from '../core/ai.js';
 import {
   wantsCatalog, wantsHuman, wantsLocation, wantsClose, wantsPrice,
   looksLikeFullName, detectDepartamento, detectSubzona, parseHectareas,
@@ -13,7 +13,7 @@ import {
   btnsHectareas, btnsCampana, btnCotizar, summaryText
 } from '../core/flow.js';
 import {
-  waSendText, waSendButtons, waUploadMediaFromFile, waSendDocument
+  waSendText, waSendButtons, waUploadMediaFromFile, waSendDocument, waDownloadMedia
 } from './send.js';
 import { parseCartFromText } from './parse.js';
 import { buildQuote } from '../src/quote.js';
@@ -52,17 +52,6 @@ function isMenuCommand(t = '') {
 
 function exitModes(s) { s.mode = null; }
 
-// Detectar cultivo por texto libre
-function detectCropFromText(text) {
-  const n = normalize(text);
-  if (/\b(soja|soya)\b/.test(n)) return 'Soya';
-  if (/\b(maiz|maíz)\b/.test(n)) return 'Maíz';
-  if (/\b(trigo)\b/.test(n)) return 'Trigo';
-  if (/\b(arroz)\b/.test(n)) return 'Arroz';
-  if (/\b(girasol)\b/.test(n)) return 'Girasol';
-  return null;
-}
-
 function goHome(to, s) {
   exitModes(s);
   s.awaitingSlot = null;
@@ -70,13 +59,14 @@ function goHome(to, s) {
   s.slotRetries = {}; // reset
   waSendText(
     to,
-    '🏠 Volvimos al menú principal. Decime si querés *Cotizar*, ver *Catálogo* o hacer *Preguntas/Dudas*.'
+    '🏠 Volvimos al menú principal. Podés escribir lo que necesitás (producto, problema o cultivo). ' +
+    'Si preferís botones, elegí abajo.'
   );
-  return waSendButtons(to, 'Puedo ayudarte con:', [
+  return waSendButtons(to, 'Opciones rápidas:', [
     { id: 'btn_quote', title: '🧾 Cotizar' },
     { id: 'btn_catalog', title: 'Catálogo' },
     { id: 'btn_faq', title: 'Preguntas / Dudas' },
-    { id: 'btn_human', title: 'Hablar con asesor' }
+    { id: 'btn_human', title: 'Asesor' }
   ]);
 }
 
@@ -122,24 +112,34 @@ function bumpRetryAndMaybeOfferMenu(to, s, slot) {
   return null;
 }
 
+// IA-first: primer pedido en texto, botones recién en reintento
 async function askForSlot(to, slot, s) {
   if (!shouldAskSlot(s, slot)) return; // evitar spam
   s.hinted = s.hinted || {};
-  const hint = s.hinted[slot] ? '' : '\nSi te equivocaste, escribí *volver* para ir al menú.';
+  const hint = s.hinted[slot] ? '' : '\nPodés escribirlo libremente. Si te equivocaste, escribí *volver* para ir al menú.';
   s.hinted[slot] = true;
 
   switch (slot) {
     case 'cultivo':
-      return waSendButtons(to, `¿Para qué *cultivo* es? Elegí una opción:${hint}`, btnsCultivos());
+      await waSendText(to, `¿Para qué *cultivo* es? (ej: Soya, Maíz, Trigo, Arroz, Girasol)${hint}`);
+      if ((s.slotRetries?.[slot] || 0) >= 1) await waSendButtons(to, 'También podés elegir:', btnsCultivos());
+      return;
     case 'hectareas':
-      await waSendButtons(to, `¿Cuántas *hectáreas* vas a trabajar?${hint}`, btnsHectareas());
-      return waSendText(to, 'También podés escribir el número (ej: 120).');
+      await waSendText(to, `¿Cuántas *hectáreas* vas a trabajar? (ej: 120)${hint}`);
+      if ((s.slotRetries?.[slot] || 0) >= 1) await waSendButtons(to, 'Atajos:', btnsHectareas());
+      return;
     case 'campana':
-      return waSendButtons(to, `¿Para qué *campaña*?${hint}`, btnsCampana());
+      await waSendText(to, `¿Para qué *campaña*? (Verano / Invierno)${hint}`);
+      if ((s.slotRetries?.[slot] || 0) >= 1) await waSendButtons(to, 'Atajos:', btnsCampana());
+      return;
     case 'departamento':
-      return waSendButtons(to, `¿En qué *Departamento* estás?${hint}`, btnsDepartamento());
+      await waSendText(to, `¿En qué *Departamento* estás?${hint}`);
+      if ((s.slotRetries?.[slot] || 0) >= 1) await waSendButtons(to, 'Atajos:', btnsDepartamento());
+      return;
     case 'subzona':
-      return waSendButtons(to, `Seleccioná tu *Subzona* en Santa Cruz:${hint}`, btnsSubzonaSCZ());
+      await waSendText(to, `Seleccioná o escribí tu *Subzona* en Santa Cruz (p.ej. Norte Integrado, Chiquitania).${hint}`);
+      if ((s.slotRetries?.[slot] || 0) >= 1) await waSendButtons(to, 'Atajos:', btnsSubzonaSCZ());
+      return;
   }
 }
 
@@ -162,7 +162,7 @@ function applyActionToSession(s, a) {
       s.cultivo = a.value; s.awaitingSlot = null; s.awaitingAt = 0; break;
     case 'set_hectareas': {
       const h = parseHectareas(String(a.value));
-      if (Number.isFinite(h)) { s.hectareas = h; s.awaitingSlot = null; s.awaitingAt = 0; }
+      if (Number.isFinite(h) || h) { s.hectareas = h; s.awaitingSlot = null; s.awaitingAt = 0; }
       break;
     }
     case 'set_campana':
@@ -230,21 +230,22 @@ router.post('/webhook', async (req, res) => {
       }
     }
 
-    // Saludo (con nombre si lo tenemos)
+    // Saludo una vez por sesión (con nombre si lo tenemos)
     if (!s.greeted) {
       s.greeted = true;
       const nombre = s.name || s.profileName;
       await waSendText(
         fromId,
         `👋 ¡Bienvenido/a ${nombre ? `*${nombre}* ` : ''}a *NewChem Agroquímicos*! Contame, ¿qué necesitás hoy?\n` +
-        'Podés escribirme el producto, pegar tu lista, o mandarme una foto con el nombre. ' +
+        'Podés escribirme el producto, pegar tu lista, o mandarme una foto. ' +
         'Si querés regresar al menú, escribí *volver*.'
       );
-      await waSendButtons(fromId, 'Puedo ayudarte con:', [
+      // IA-first: mostramos botones como apoyo, no como paso obligado
+      await waSendButtons(fromId, 'Atajos (opcionales):', [
         { id: 'btn_quote', title: '🧾 Cotizar' },
         { id: 'btn_catalog', title: 'Catálogo' },
-        { id: 'btn_faq', title: 'Preguntas / Dudas' },
-        { id: 'btn_human', title: 'Hablar con asesor' }
+        { id: 'btn_faq', title: 'Dudas' },
+        { id: 'btn_human', title: 'Asesor' }
       ]);
       saveSession(fromId, s);
       return res.sendStatus(200);
@@ -271,7 +272,7 @@ router.post('/webhook', async (req, res) => {
       return res.sendStatus(200);
     }
 
-    // Botones
+    // Botones de apoyo
     if (incomingText === 'btn_catalog') {
       exitModes(s);
       await waSendText(fromId, `🛒 Catálogo: ${config.CATALOG_URL || 'No disponible'}`);
@@ -290,7 +291,7 @@ router.post('/webhook', async (req, res) => {
     if (incomingText === 'btn_quote') {
       exitModes(s);
       const missing = nextMissingSlot(s) || 'cultivo';
-      await waSendText(fromId, '¡Perfecto! Armemos tu cotización rápido 😊');
+      await waSendText(fromId, '¡Perfecto! Armemos tu cotización rápido 😊 (podés escribir libremente).');
       await askForSlot(fromId, missing, s);
       saveSession(fromId, s);
       return res.sendStatus(200);
@@ -305,16 +306,65 @@ router.post('/webhook', async (req, res) => {
       return res.sendStatus(200);
     }
 
-    // Dep/Sub
+    // === NUEVO: FOTO → IA visión (sin depender del caption)
+    if (type === 'image' && msg.image?.id) {
+      const mediaBuf = await waDownloadMedia(msg.image.id);
+      if (mediaBuf) {
+        const vision = await aiIdentifyProductFromPhoto(mediaBuf, catalog);
+        if (vision.hit && vision.product) {
+          s.items.push({ name: vision.product.name, qty: 1, price: null });
+          await waSendText(fromId, `🖼️ Parece *${vision.product.name}*. Sí, lo vendemos 🙌 ¿Querés que lo cotice?`);
+        } else {
+          // fallback con caption si vino
+          const caption = msg.image?.caption || '';
+          if (caption) {
+            const found = searchProductByText(catalog, caption);
+            if (found) {
+              s.items.push({ name: found.name, qty: 1, price: null });
+              await waSendText(fromId, `🖼️ Identifiqué *${found.name}* por el texto. Lo agrego a tu cotización.`);
+            } else {
+              const label = vision.label ? `(*${vision.label}*)` : '';
+              await waSendText(fromId, `Recibí tu foto ${label}. Parece *${vision.category || 'otro'}*. ` +
+                `No vendemos ese producto 😅. Decime el *nombre* de un producto del catálogo y lo cotizo.`);
+            }
+          } else {
+            const label = vision.label ? ` (*${vision.label}*)` : '';
+            if (vision.category && vision.category !== 'agroquimico') {
+              await waSendText(fromId, `Parece ${vision.category}${label}. ` +
+                `No vendemos eso 😅. Mandame el nombre de un producto del catálogo y lo cotizo.`);
+            } else {
+              await waSendText(fromId, 'Recibí la imagen. No pude identificar el producto con certeza. ' +
+                '¿Me indicás el *nombre comercial* tal como figura en la etiqueta?');
+            }
+          }
+        }
+      } else {
+        await waSendText(fromId, 'Recibí la imagen 👍. ¿Me indicás el *nombre comercial* del producto para reconocerlo?');
+      }
+      // tras procesar foto, empujar al siguiente paso si corresponde
+      if (hasEnoughForQuote(s)) {
+        await waSendText(fromId, `${summaryText(s)}\n\n¿Generamos tu PDF de cotización?`);
+        await waSendButtons(fromId, '¿Listo para *Cotizar*?', btnCotizar());
+      } else {
+        const missing = nextMissingSlot(s) || 'cultivo';
+        await askForSlot(fromId, missing, s);
+      }
+      saveSession(fromId, s);
+      return res.sendStatus(200);
+    }
+
+    // Dep/Sub (botones)
     if (incomingText?.startsWith?.('dep_')) {
       const idx = Number(incomingText.split('_')[1]);
       const dep = DEPARTAMENTOS[idx];
       if (dep) {
         s.departamento = dep;
         if (dep === 'Santa Cruz') {
-          await waSendButtons(fromId, 'Seleccioná tu *Subzona* en Santa Cruz:', btnsSubzonaSCZ());
+          await waSendText(fromId, '¿Cuál es tu *Subzona* en Santa Cruz? (podés escribirla)');
+          await waSendButtons(fromId, 'Atajos:', btnsSubzonaSCZ());
         } else {
-          await waSendButtons(fromId, 'Genial. ¿Para qué *Cultivo* es?', btnsCultivos());
+          await waSendText(fromId, 'Genial. ¿Para qué *Cultivo* es? (podés escribirlo)');
+          await waSendButtons(fromId, 'Atajos:', btnsCultivos());
           s.stage = 'product';
         }
         s.awaitingSlot = null; s.awaitingAt = 0;
@@ -327,7 +377,8 @@ router.post('/webhook', async (req, res) => {
       const sub = SUBZONAS_SCZ[idx];
       if (sub) {
         s.subzona = sub;
-        await waSendButtons(fromId, 'Perfecto. ¿Qué *Cultivo* vas a trabajar?', btnsCultivos());
+        await waSendText(fromId, 'Perfecto. ¿Qué *Cultivo* vas a trabajar? (podés escribirlo)');
+        await waSendButtons(fromId, 'Atajos:', btnsCultivos());
         s.stage = 'product';
         s.awaitingSlot = null; s.awaitingAt = 0;
         saveSession(fromId, s);
@@ -335,7 +386,7 @@ router.post('/webhook', async (req, res) => {
       }
     }
 
-    // Cultivo/HA/Campaña
+    // Cultivo/HA/Campaña (botones de apoyo)
     if (incomingText?.startsWith?.('crop_')) {
       const id = incomingText.split('_')[1] || '';
       const map = { soya: 'Soya', maiz: 'Maíz', trigo: 'Trigo', arroz: 'Arroz', girasol: 'Girasol', otro: 'Otro' };
@@ -344,7 +395,7 @@ router.post('/webhook', async (req, res) => {
         s.cultivo = cult;
         s.awaitingSlot = null; s.awaitingAt = 0;
         exitModes(s);
-        await waSendButtons(fromId, '¿Cuántas *hectáreas* vas a trabajar?', btnsHectareas());
+        await askForSlot(fromId, 'hectareas', s);
         saveSession(fromId, s);
         return res.sendStatus(200);
       }
@@ -354,7 +405,7 @@ router.post('/webhook', async (req, res) => {
       const num = Number(val.replace(/[^\d]/g, ''));
       if (Number.isFinite(num) && num > 0) { s.hectareas = num; s.awaitingSlot = null; s.awaitingAt = 0; }
       exitModes(s);
-      await waSendButtons(fromId, '¿Para qué *campaña*?', btnsCampana());
+      await askForSlot(fromId, 'campana', s);
       saveSession(fromId, s);
       return res.sendStatus(200);
     }
@@ -365,10 +416,9 @@ router.post('/webhook', async (req, res) => {
         s.awaitingSlot = null; s.awaitingAt = 0;
         exitModes(s);
         if (!s.departamento) {
-          await waSendButtons(fromId, '¿En qué *Departamento* estás?', btnsDepartamento());
+          await askForSlot(fromId, 'departamento', s);
         } else {
           s.stage = 'checkout';
-          // NUEVO: evitar duplicado de resumen en 30s
           const now = Date.now();
           if (!s.shownSummaryAt || (now - s.shownSummaryAt) > 30000) {
             s.shownSummaryAt = now;
@@ -390,9 +440,9 @@ router.post('/webhook', async (req, res) => {
         exitModes(s);
         await waSendText(fromId, `🛒 Agregué *${p.name}* a tu cotización.`);
         s.stage = s.stage || 'product';
-        if (!s.cultivo) await waSendButtons(fromId, '¿Para qué *cultivo* es?', btnsCultivos());
-        else if (s.hectareas == null) await waSendButtons(fromId, '¿Cuántas *hectáreas*?', btnsHectareas());
-        else if (!s.campana) await waSendButtons(fromId, '¿Para qué *campaña*?', btnsCampana());
+        // IA-first: pedir lo que falte con texto y solo luego botones
+        const miss = nextMissingSlot(s);
+        if (miss) await askForSlot(fromId, miss, s);
         else {
           s.stage = 'checkout';
           const now = Date.now();
@@ -407,27 +457,7 @@ router.post('/webhook', async (req, res) => {
       }
     }
 
-    // Imagen → reconocer por caption
-    if (type === 'image') {
-      const caption = msg.image?.caption || '';
-      if (config.DEBUG_LOGS) console.log('[IMG] caption:', caption);
-      if (caption) {
-        const found = searchProductByText(catalog, caption);
-        if (found) {
-          s.items.push({ name: found.name, qty: 1, price: null });
-          await waSendText(fromId, `🖼️ Identifiqué *${found.name}*. Lo agrego a tu cotización.`);
-          s.stage = s.stage || 'product';
-        } else {
-          await waSendText(fromId, 'Recibí la imagen. Para reconocer el producto, escribime el *nombre* tal como figura en el envase (o en nuestro catálogo).');
-        }
-      } else {
-        await waSendText(fromId, 'Recibí la imagen. Escribime el *nombre del producto* y lo agrego 😉');
-      }
-      saveSession(fromId, s);
-      return res.sendStatus(200);
-    }
-
-    // Atajos globales
+    // Atajos globales por texto
     if (wantsCatalog(incomingText)) {
       await waSendText(fromId, `🛒 Catálogo: ${config.CATALOG_URL || 'No disponible'}`);
       await waSendText(fromId, 'Decime qué producto te interesa y te lo cotizo 😉\nEscribí *volver* para regresar al menú.');
@@ -458,7 +488,7 @@ router.post('/webhook', async (req, res) => {
       return res.sendStatus(200);
     }
 
-    // Carrito pegado
+    // Carrito pegado (texto)
     if (type === 'text' && !/^(dep_|sub_|crop_|ha_|camp_|do_quote|add_)/.test(incomingText)) {
       const cart = parseCartFromText(incomingText);
       if (cart?.items?.length) {
@@ -467,41 +497,20 @@ router.post('/webhook', async (req, res) => {
       }
     }
 
-    // IA suave
+    // IA estructurada (slots + intent)
+    const extracted = await aiExtractFields(incomingText, s);
+    if (extracted?.nombre && !s.profileName) s.profileName = extracted.nombre;
+    if (extracted?.departamento && !s.departamento) s.departamento = extracted.departamento;
+    if (extracted?.subzona && !s.subzona) s.subzona = extracted.subzona;
+    if (extracted?.cultivo && !s.cultivo) s.cultivo = extracted.cultivo;
+    if ((Number.isFinite(extracted?.hectareas) || extracted?.hectareas) && !s.hectareas) s.hectareas = extracted.hectareas;
+    if (extracted?.campana && !s.campana) s.campana = extracted.campana;
+
+    // Decisor clásico (acciones adicionales)
     const actions = await aiDecide(incomingText, s);
     for (const a of actions) applyActionToSession(s, a);
 
-    if (actions.some(a => a.action === 'want_catalog')) {
-      await waSendText(fromId, `🛒 Catálogo: ${config.CATALOG_URL || 'No disponible'}`);
-      await waSendText(fromId, 'Decime qué producto te interesa y te lo cotizo 😉');
-      saveSession(fromId, s);
-      return res.sendStatus(200);
-    }
-    if (actions.some(a => a.action === 'want_location')) {
-      if (config.STORE_LAT && config.STORE_LNG) {
-        await waSendText(fromId, `📍 Estamos aquí: https://www.google.com/maps?q=${config.STORE_LAT},${config.STORE_LNG}`);
-      } else {
-        await waSendText(fromId, '📍 Nuestra ubicación estará disponible pronto.');
-      }
-      saveSession(fromId, s);
-      return res.sendStatus(200);
-    }
-    if (actions.some(a => a.action === 'want_human')) {
-      s.pausedUntil = Date.now() + 4 * 60 * 60 * 1000;
-      await waSendText(fromId, '🧑‍💼 Te conecto con un asesor.');
-      await waSendText(fromId, '📞 +591 65900645\n👉 https://wa.me/59165900645');
-      await waSendText(fromId, 'Para volver conmigo, escribí *continuar*.');
-      saveSession(fromId, s);
-      return res.sendStatus(200);
-    }
-    if (actions.some(a => a.action === 'want_close')) {
-      s.stage = 'closed';
-      await waSendText(fromId, '✅ Conversación finalizada. ¡Gracias por contactarnos!');
-      saveSession(fromId, s);
-      return res.sendStatus(200);
-    }
-
-    // FAQ (solo si el usuario envía TEXTO)
+    // FAQ (texto)
     if ((s.mode === 'faq' && type === 'text') || actions.some(a => a.action === 'want_advice')) {
       const raw = actions.find(a => a.action === 'want_advice')?.value || incomingText || '';
       const adv = getAdvice(raw, catalog);
@@ -513,9 +522,8 @@ router.post('/webhook', async (req, res) => {
         }));
         await waSendButtons(fromId, '¿Querés agregar alguno a tu cotización?', btns);
       } else {
-        await waSendButtons(fromId, '¿Te ayudo a elegir por *cultivo*?', btnsCultivos());
+        await waSendText(fromId, 'Podés decirme el *cultivo* (Soya, Maíz, etc.) o el *problema* (chinche, roya…) y te recomiendo 🙂');
       }
-      // si no fue texto, salimos para evitar loops; si fue texto, seguimos en FAQ
       if (type !== 'text') exitModes(s);
       saveSession(fromId, s);
       return res.sendStatus(200);
@@ -535,8 +543,8 @@ router.post('/webhook', async (req, res) => {
 
     // Envíos / Pago
     if (actions.some(a => a.action === 'want_shipping')) {
-      await waSendText(fromId, '🚚 Sí, hacemos envíos. Para estimar costo y plazo, ¿en qué *Departamento* estás?');
-      await waSendButtons(fromId, 'Elegí tu *Departamento*:', btnsDepartamento());
+      await waSendText(fromId, '🚚 Sí, hacemos envíos. Para estimar costo y plazo, ¿en qué *Departamento* estás? (podés escribirlo)');
+      await waSendButtons(fromId, 'Atajos:', btnsDepartamento());
       saveSession(fromId, s);
       return res.sendStatus(200);
     }
@@ -544,13 +552,13 @@ router.post('/webhook', async (req, res) => {
       await waSendText(fromId, '💳 Aceptamos efectivo, QR y transferencia. ¿Querés que avance con tu cotización?');
     }
 
-    // Empujoncito a dudas si hay desvío mientras pedimos slot
+    // Empujón suave si estamos esperando un slot
     if (s.awaitingSlot && type === 'text' && !/^(dep_|sub_|crop_|ha_|camp_|do_quote|add_|volver|men[úu]|menu|principal)/i.test(incomingText)) {
       await waSendText(fromId, 'Si preferís, podemos charlar en *Preguntas/Dudas*. Escribí *dudas* para entrar en ese modo, o decime lo que falta y seguimos 🙂');
     }
 
     // ¿Listo para cotizar?
-    const ready = hasEnoughForQuote(s) || actions.some(a => a.action === 'want_quote') || wantsPrice(incomingText);
+    const ready = hasEnoughForQuote(s) || extracted?.intent === 'ready_to_quote' || actions.some(a => a.action === 'want_quote') || wantsPrice(incomingText);
     if (ready) {
       s.stage = 'checkout';
       const now = Date.now();
@@ -566,26 +574,9 @@ router.post('/webhook', async (req, res) => {
       return res.sendStatus(200);
     }
 
-    // Si falta algo, intentar cubrir por texto libre (cultivo)
-    const missing = nextMissingSlot(s);
-    if (type === 'text' && missing === 'cultivo' && !/^btn_/.test(incomingText)) {
-      const guess = detectCropFromText(incomingText);
-      if (guess) { s.cultivo = guess; s.awaitingSlot = null; s.awaitingAt = 0; }
-    }
-
-    // Falta algo: pedir SOLO lo que falta, con anti-loop
+    // Falta algo: pedir SOLO lo que falta, IA-first
     if (nextMissingSlot(s)) {
       const slot = nextMissingSlot(s);
-      if (type === 'text' && !detectCropFromText(incomingText) && slot === 'cultivo') {
-        // off-topic simpático
-        const math = incomingText.match(/^\s*(\d+)\s*\+\s*(\d+)\s*$/);
-        if (math) {
-          const a = Number(math[1]), b = Number(math[2]);
-          await waSendText(fromId, `😄 Eso es *${a + b}*. Ahora, para ayudarte mejor ¿te muestro opciones por *cultivo*?`);
-        } else {
-          await waSendText(fromId, '🙂 Te leo. Para afinar la recomendación, necesito el *cultivo*.');
-        }
-      }
       await askForSlot(fromId, slot, s);
       bumpRetryAndMaybeOfferMenu(fromId, s, slot);
       saveSession(fromId, s);
@@ -620,7 +611,6 @@ router.post('/webhook', async (req, res) => {
         await waSendText(fromId, 'No pude subir el PDF a WhatsApp. Intentá de nuevo en un momento.');
       }
       try { await sheetsAppendFromSession(s, fromId, 'closed'); } catch {}
-      // NUEVO: persistir cliente
       if (s.name) upsertClient(fromId, { name: s.name });
       s.stage = 'closed';
       saveSession(fromId, s);
@@ -638,7 +628,6 @@ router.post('/webhook', async (req, res) => {
         await waSendText(fromId, 'No pude subir el PDF a WhatsApp. Intentá de nuevo en un momento.');
       }
       try { await sheetsAppendFromSession(s, fromId, 'closed'); } catch {}
-      // NUEVO: persistir cliente
       upsertClient(fromId, { name: s.name });
       s.stage = 'closed';
       saveSession(fromId, s);
@@ -647,7 +636,6 @@ router.post('/webhook', async (req, res) => {
 
     // Guardar "lastSeen" aunque no haya cierre
     upsertClient(fromId, {});
-
     saveSession(fromId, s);
     res.sendStatus(200);
   } catch (e) {
