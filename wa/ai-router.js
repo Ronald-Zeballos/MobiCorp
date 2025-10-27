@@ -1,71 +1,122 @@
 // wa/ai-router.js
-import { aiDecideNext, aiMatchCatalogFromImage } from "../core/ai.js";
-import { S } from "../server.js"; // si S no está exportado, muévelo a un módulo compartido
-import { toText, askNombre, askDepartamento, askSubzonaSCZ, askSubzonaLibre,
-         askCultivo, askCultivoLibre, askHectareas, askHectareasLibre,
-         askCampana, askCategory, summaryText } from "./router-helpers.js"; // extrae helpers en este archivo
-import fs from "fs";
+import { aiExtractFields, aiIdentifyProductFromPhoto, quickIntent, shouldCloseNow } from "../core/ai.js";
+import { smartAskNext, askForQuoteConfirmation, DEPARTAMENTOS, SUBZONAS_SCZ } from "../core/flow.js";
+import { sendCatalogLink, sendImage, sendText, sendButtons, sendList } from "./send.js";
+import { sendAutoQuotePDF } from "../src/quote.js";
 
-const CATALOG = JSON.parse(fs.readFileSync("./knowledge/catalog.json","utf8"));
+const ui = {
+  text: sendText,
+  buttons: sendButtons,
+  list: sendList,
+  image: sendImage
+};
 
-export async function handleAIText({ fromId, text }) {
-  const s = S(fromId);
-  const out = await aiDecideNext({ message: text, session: s });
-
-  // Merge entidades “suaves”
-  const e = out.entities || {};
-  if (e.nombre && !s.profileName) s.profileName = e.nombre;
-  if (e.departamento && !s.vars.departamento) s.vars.departamento = e.departamento;
-  if (e.subzona && !s.vars.subzona) s.vars.subzona = e.subzona;
-  if (e.cultivo && (!s.vars.cultivos || !s.vars.cultivos.length)) s.vars.cultivos = [e.cultivo];
-  if (e.hectareas && !s.vars.hectareas) s.vars.hectareas = String(e.hectareas);
-  if (e.campana && !s.vars.campana) s.vars.campana = e.campana;
-
-  if (Array.isArray(out.cart) && out.cart.length) {
-    s.vars.cart = out.cart;
+// Normaliza selección de listas/botones
+function applySelection(id, s) {
+  if (!id) return;
+  if (id.startsWith("DPTO_")) {
+    s.vars.departamento = id.replace("DPTO_","");
+    s.vars.subzona = null;
+    return;
   }
-
-  // Router por acción
-  switch (out.action) {
-    case "ask_nombre":       return askNombre(fromId);
-    case "ask_departamento": return askDepartamento(fromId);
-    case "ask_subzona": {
-      if (s.vars.departamento === "Santa Cruz") return askSubzonaSCZ(fromId);
-      return askSubzonaLibre(fromId);
-    }
-    case "ask_cultivo":      return askCultivo(fromId);
-    case "ask_hectareas":    return askHectareas(fromId);
-    case "ask_campana":      return askCampana(fromId);
-    case "add_to_cart": {
-      if (!s.vars.cart) s.vars.cart = [];
-      if (e.producto) s.vars.cart.push({ nombre:e.producto, cantidad:e.cantidad || "1 unid" });
-      await toText(fromId, "Añadido al carrito. ¿Deseas algo más o prefieres cotizar?");
-      return;
-    }
-    case "show_catalog":     return askCategory(fromId);
-    case "summarize":        return toText(fromId, summaryText(s));
-    case "close_quote": {
-      // dejamos que tu flujo existente valide y muestre botón Cotizar
-      return toText(fromId, summaryText(s)).then(() =>
-        toText(fromId, "¿Listo para *cotizar*? Escribe *Cotizar* o usa el botón.")
-      );
-    }
-    case "handoff_human":    return toText(fromId, "Listo. Aviso a un asesor para que te contacte por este chat. 🙌");
-    case "smalltalk":
-    default:
-      return toText(fromId, "Perfecto. ¿Te ayudo a elegir producto o prefieres ver el catálogo?");
+  if (id.startsWith("SUBZ_")) {
+    const key = id.replace("SUBZ_","");
+    const mapa = {NORTE:"Norte", ESTE:"Este", SUR:"Sur", VALLES:"Valles", CHIQUITANIA:"Chiquitania"};
+    s.vars.subzona = mapa[key] || key;
+    return;
+  }
+  if (id.startsWith("CROP_")) {
+    const v = id.replace("CROP_","");
+    if (v === "Otro") s.vars.cultivos = [];
+    else s.vars.cultivos = [v];
+    return;
+  }
+  if (id.startsWith("HA_")) {
+    const label = {
+      HA_0_100:'0–100 ha', HA_101_300:'101–300 ha', HA_301_500:'301–500 ha',
+      HA_1000_3000:'1,000–3,000 ha', HA_3001_5000:'3,001–5,000 ha', HA_5000_MAS:'+5,000 ha'
+    }[id] || '—';
+    s.vars.hectareas = label;
+    return;
+  }
+  if (id.startsWith("CAMP_")) {
+    s.vars.campana = id.replace("CAMP_","");
+    return;
   }
 }
 
-export async function handleAIImage({ fromId, imageUrl }) {
-  const s = S(fromId);
-  const res = await aiMatchCatalogFromImage({ imageUrl, catalog: CATALOG });
+export async function handleIncoming({ fromId, s, msg }) {
+  const type = msg.type;
 
-  if (res?.match && res.confidence >= 0.6) {
-    s.vars.cart = s.vars.cart || [];
-    s.vars.cart.push({ nombre: res.match.nombre, presentacion: res.match.presentacion || null, cantidad: "1 unid" });
-    await toText(fromId, `Creo que es *${res.match.nombre}* (confianza ${(res.confidence*100).toFixed(0)}%). Lo añadí al carrito. ¿Deseas cotizar o agregar otro?`);
-  } else {
-    await toText(fromId, "No estoy 100% seguro del producto. ¿Puedes confirmar el *nombre* o mandarme una foto más nítida de la etiqueta frontal?");
+  // === 1) Foto: IA visión intenta reconocer producto del catálogo
+  if (type === "image") {
+    const url = msg.image?.link || msg.image?.url;
+    if (url) {
+      const match = await aiIdentifyProductFromPhoto(url);
+      if (match) {
+        await ui.image(fromId, { localName: `${match}.jpg` }); // si tienes /image/Nombre.jpg
+        await ui.text(fromId, `Parece *${match}*. ¿Deseas cotizarlo?`);
+        await sendCatalogLink(fromId);
+      } else {
+        await ui.text(fromId, "Recibí la imagen 👍. No pude identificar el producto con certeza. ¿Me indicas el nombre?");
+      }
+    }
+    return await smartAskNext(fromId, s, ui);
+  }
+
+  // === 2) Interactivos (botones/listas)
+  if (type === "interactive") {
+    const id = msg.interactive?.button_reply?.id || msg.interactive?.list_reply?.id;
+    applySelection(id, s);
+    if (id === "ACTION_GENERAR_PDF") {
+      return await generateQuote(fromId, s);
+    }
+    return await smartAskNext(fromId, s, ui);
+  }
+
+  // === 3) Texto libre → IA extrae info
+  if (type === "text") {
+    const text = (msg.text?.body || "").trim();
+    // Intent rápido
+    const qi = quickIntent(text);
+    if (qi === "ask_catalog") {
+      await sendCatalogLink(fromId);
+      return await smartAskNext(fromId, s, ui);
+    }
+    if (qi === "handoff") {
+      await ui.text(fromId, "¡Claro! Avisé a un asesor para que te escriba por este chat. Pauso el asistente un momento 🙌");
+      s.meta = s.meta || {}; s.meta.human = true;
+      return;
+    }
+
+    // IA estructurada
+    const out = await aiExtractFields(text, s);
+    if (out?.nombre && !s.profileName) s.profileName = out.nombre;
+    if (out?.departamento && !s.vars.departamento) s.vars.departamento = out.departamento;
+    if (out?.subzona && !s.vars.subzona) s.vars.subzona = out.subzona;
+    if (out?.cultivo && (!s.vars.cultivos || !s.vars.cultivos.length)) s.vars.cultivos = [out.cultivo];
+    if (out?.hectareas && !s.vars.hectareas) s.vars.hectareas = out.hectareas;
+    if (out?.campana && !s.vars.campana) s.vars.campana = out.campana;
+
+    if (out?.intent === "ready_to_quote" || shouldCloseNow(s)) {
+      return await askForQuoteConfirmation(fromId, s, ui);
+    }
+    return await smartAskNext(fromId, s, ui);
+  }
+}
+
+// ==== Cierre lineal ====
+async function generateQuote(fromId, s) {
+  try {
+    const pdf = await sendAutoQuotePDF(fromId, s);
+    if (pdf?.mediaId) {
+      await ui.text(fromId, "📄 ¡Listo! Te envié tu *cotización en PDF*. Si deseas ajustar cantidades o agregar productos, dime y lo recalculamos.");
+    } else {
+      await ui.text(fromId, "Generé tu PDF, pero no pude adjuntarlo automáticamente. Avísame y lo reintento.");
+    }
+    // opcional: activar modo humano
+    s.meta = s.meta || {}; s.meta.human = true;
+  } catch (e) {
+    await ui.text(fromId, "No pude generar el PDF ahora. ¿Te parece si lo intento nuevamente o prefieres que te contacte un asesor?");
   }
 }
