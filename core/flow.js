@@ -1,80 +1,45 @@
-// --- Opciones estáticas del flujo ---
-export const DEPARTAMENTOS = [
-  "Santa Cruz","Cochabamba","La Paz","Chuquisaca","Tarija","Oruro","Potosí","Beni","Pando"
-];
+// core/flow.js
+import { CROP_OPTIONS, DEPARTAMENTOS, SUBZONAS_SCZ, HA_RANGES } from './intents.js';
 
-export const SUBZONAS_SCZ = [
-  "Norte Integrado","Norte","Este","Sur","Valles","Chiquitania"
-];
-
-export const CROP_OPTIONS = [
-  { title: "Soya", payload: "CROP_SOYA" },
-  { title: "Maíz", payload: "CROP_MAIZ" },
-  { title: "Trigo", payload: "CROP_TRIGO" },
-  { title: "Arroz", payload: "CROP_ARROZ" },
-  { title: "Girasol", payload: "CROP_GIRASOL" },
-  { title: "Otro", payload: "CROP_OTRO" }
-];
-
-export const HECTARE_OPTIONS = [
-  { title:"0–100 ha",       payload:"HA_0_100" },
-  { title:"101–300 ha",     payload:"HA_101_300" },
-  { title:"301–500 ha",     payload:"HA_301_500" },
-  { title:"1,000–3,000 ha", payload:"HA_1000_3000" },
-  { title:"3,001–5,000 ha", payload:"HA_3001_5000" },
-  { title:"+5,000 ha",      payload:"HA_5000_MAS" },
-  { title:"Otras cantidades", payload:"HA_OTRA" }
-];
-
-export const CAMP_BTNS = [
-  { title:"Verano",   payload:"CAMP_VERANO" },
-  { title:"Invierno", payload:"CAMP_INVIERNO" }
-];
-
-// === ESTE FALTABA (lo pide router.js) ===
-export const btnCotizar = [
-  { title: "Cotizar", payload: "QR_FINALIZAR" }
-];
-
-// Helpers para construir textos/filas (si no los tienes ya)
-export function btnsDepartamentos() {
-  return DEPARTAMENTOS.map(d => ({ title: d, payload: `DPTO_${d.toUpperCase().replace(/\s+/g,'_')}` }));
+// --- Constructores de botones (WhatsApp interactive/button) ---
+export function btnsDepartamento() {
+  return DEPARTAMENTOS.map((d, i) => ({ id: `dep_${i}`, title: d }));
 }
-export function btnsSubzonasSCZ() {
-  return SUBZONAS_SCZ.map(z => ({ title: z, payload: `SUBZ_${z.toUpperCase().replace(/\s+/g,'_')}` }));
+
+export function btnsSubzonaSCZ() {
+  return SUBZONAS_SCZ.map((z, i) => ({ id: `sub_${i}`, title: z }));
 }
+
 export function btnsCultivos() {
-  return CROP_OPTIONS;
+  return CROP_OPTIONS.map((c, i) => ({ id: `crop_${i}`, title: c }));
 }
+
 export function btnsHectareas() {
-  return HECTARE_OPTIONS;
+  return HA_RANGES.map((h, i) => ({ id: `ha_${i}`, title: h }));
 }
+
 export function btnsCampana() {
-  return CAMP_BTNS;
+  return [
+    { id: 'camp_verano',  title: 'Verano'  },
+    { id: 'camp_invierno', title: 'Invierno' }
+  ];
 }
 
-// Resumen (ajústalo si ya tienes otro)
+// Botón único “Cotizar”
+export function btnCotizar() {
+  return [{ id: 'do_quote', title: '🧾 Cotizar' }];
+}
+
+// --- Resumen textual listo para pegar ---
 export function summaryText(s) {
-  const nombre = s.profileName || 'Cliente';
-  const dep    = s.vars?.departamento || 'ND';
-  const zona   = s.vars?.subzona || 'ND';
-  const cultivo= (s.vars?.cultivos && s.vars.cultivos[0]) || 'ND';
-  const ha     = s.vars?.hectareas || 'ND';
-  const camp   = s.vars?.campana || 'ND';
-
-  const prods = (s.vars?.cart||[]).length
-    ? s.vars.cart.map(it => `• ${it.nombre}${it.presentacion?` (${it.presentacion})`:''} — ${it.cantidad}`).join('\n')
-    : '• (pendiente: añade productos desde el catálogo)';
-
   return [
-    '🧾 *Resumen de solicitud*',
-    `• Cliente: *${nombre}*`,
-    `• Departamento: *${dep}*`,
-    `• Subzona: *${zona}*`,
-    `• Cultivo: *${cultivo}*`,
-    `• Hectáreas: *${ha}*`,
-    `• Campaña: *${camp}*`,
-    '',
-    prods
-  ].join('\n');
+    '📝 *Resumen de solicitud*',
+    s.name         ? `• Cliente: *${s.name}*` : null,
+    s.departamento ? `• Departamento: *${s.departamento}*` : null,
+    s.subzona      ? `• Subzona: *${s.subzona}*` : null,
+    s.cultivo      ? `• Cultivo: *${s.cultivo}*` : null,
+    s.hectareas    ? `• Hectáreas: *${s.hectareas}*` : null,
+    s.campana      ? `• Campaña: *${s.campana}*` : null,
+    s.items?.length ? `• Ítems: *${s.items.length}*` : null
+  ].filter(Boolean).join('\n');
 }
