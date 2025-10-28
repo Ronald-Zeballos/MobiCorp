@@ -1,41 +1,42 @@
 // core/intents.js
 
-// Normalizador
-const norm = (s = '') => s.toString().trim().toLowerCase();
+// --- Normalizador base ---
+const norm = (s = '') =>
+  s.toString().trim().toLowerCase()
+    .normalize('NFD').replace(/\p{Diacritic}/gu, '');
 
-// ---- Detectores de intención ----
-export function wantsCatalog(text) {
+// ---- Detectores de intención por texto libre ----
+export function wantsCatalog(text = '') {
   const t = norm(text);
-  return /catalogo|catálogo|ver productos|lista de precios/.test(t);
+  return /\b(catalogo|catálogo|catalog|ver productos|lista de precios)\b/.test(t);
 }
-export function wantsLocation(text) {
+export function wantsLocation(text = '') {
   const t = norm(text);
-  return /ubicaci(ón|on)|mapa|cómo llegar|donde están|dónde están/.test(t);
+  return /\b(ubicacion|ubicación|mapa|donde estan|dónde están|como llegar|cómo llegar)\b/.test(t);
 }
-export function wantsHuman(text) {
+export function wantsHuman(text = '') {
   const t = norm(text);
-  return /(asesor|humano|agente|hablar con alguien|soporte)/.test(t);
+  return /\b(asesor|humano|agente|hablar con alguien|soporte)\b/.test(t);
 }
-export function wantsClose(text) {
+export function wantsClose(text = '') {
   const t = norm(text);
-  return /(fin|terminar|gracias|chau|cerrar|finalizar)/.test(t);
+  return /\b(fin|terminar|gracias|chau|cerrar|finalizar)\b/.test(t);
 }
-export function wantsPrice(text) {
+export function wantsPrice(text = '') {
   const t = norm(text);
-  return /(precio|cotizar|cotizaci(ón|on)|presupuesto)/.test(t);
+  return /\b(precio|cotizar|cotizacion|cotización|presupuesto)\b/.test(t);
 }
-export function looksLikeFullName(text) {
+export function wantsOpenIA(text = '') {
+  const t = norm(text);
+  return /\b(dudas|ia|preguntas|chat|soporte)\b/.test(t);
+}
+
+export function looksLikeFullName(text = '') {
   const t = (text ?? '').trim();
   return t.split(/\s+/).length >= 2 && /^[a-zA-ZñÑáéíóúÁÉÍÓÚ\s'.-]+$/.test(t);
 }
 
-// ===== NUEVO: trigger explícito para FAQ/IA =====
-export function wantsFAQ(text) {
-  const t = norm(text);
-  return /\b(duda|dudas|pregunta|preguntas|recomend(a|á|as)|recomendaci(ó|o)n)\b/.test(t);
-}
-
-// ---- Catálogos / opciones (USADOS por flow.js) ----
+// ---- Catálogos / opciones visibles ----
 export const DEPARTAMENTOS = [
   'Santa Cruz','Beni','Pando','La Paz','Cochabamba','Oruro','Potosí','Chuquisaca','Tarija'
 ];
@@ -49,18 +50,29 @@ export const CROP_OPTIONS = ['Soya','Maíz','Trigo','Arroz','Girasol','Otro…']
 export const HA_RANGES = ['<50','50-100','100-300','300-500','>500','Otra…'];
 
 // ---- Parsers / detectores de campos ----
-export function detectDepartamento(text) {
+export function detectDepartamento(text = '') {
   const t = norm(text);
   return DEPARTAMENTOS.find(d => norm(d) === t) || null;
 }
-export function detectSubzona(text) {
+export function detectSubzona(text = '') {
   const t = norm(text);
   return SUBZONAS_SCZ.find(z => norm(z) === t) || null;
 }
-export function parseHectareas(text) {
+export function parseHectareas(text = '') {
   const t = norm(text).replace(',', '.');
   const m = t.match(/(\d+(\.\d+)?)/);
   if (m) return Number(m[1]);
   if (HA_RANGES.includes(text)) return text;
+  return null;
+}
+
+// ---- Heurística de cultivo desde texto libre ----
+export function detectCropFromText(text = '') {
+  const n = norm(text);
+  if (/\b(soja|soya)\b/.test(n)) return 'Soya';
+  if (/\b(maiz|maíz)\b/.test(n)) return 'Maíz';
+  if (/\b(trigo)\b/.test(n)) return 'Trigo';
+  if (/\b(arroz)\b/.test(n)) return 'Arroz';
+  if (/\b(girasol)\b/.test(n)) return 'Girasol';
   return null;
 }
