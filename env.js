@@ -17,8 +17,22 @@ export const config = {
   STORE_LNG: process.env.STORE_LNG ? Number(process.env.STORE_LNG) : undefined,
   TIMEZONE: process.env.TIMEZONE || 'America/La_Paz',
 
-  // IA (opcional)
+  // ===== IA (selector de proveedor) =====
+  AI_PROVIDER: process.env.AI_PROVIDER || 'openai',   // 'openai' | 'groq'
+
+  // OpenAI
   OPENAI_API_KEY: process.env.OPENAI_API_KEY,
+  OPENAI_MODEL: process.env.OPENAI_MODEL || 'gpt-4o-mini',
+
+  // Groq
+  GROQ_API_KEY: process.env.GROQ_API_KEY,
+  GROQ_MODEL: process.env.GROQ_MODEL || 'llama-3.1-70b-versatile',
+
+  // Parámetros de control IA (opcionales)
+  AI_MAX_TOKENS: process.env.AI_MAX_TOKENS,
+  AI_MAX_HISTORY: process.env.AI_MAX_HISTORY,
+  AI_RETRIES: process.env.AI_RETRIES,
+  AI_BASE_DELAY_MS: process.env.AI_BASE_DELAY_MS,
 
   // Google Sheets (opcional)
   GOOGLE_APPLICATION_CREDENTIALS: process.env.GOOGLE_APPLICATION_CREDENTIALS,
