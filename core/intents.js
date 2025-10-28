@@ -1,54 +1,61 @@
 // core/intents.js
-const norm = (s = '') => s.toString().trim()
-  .normalize('NFD').replace(/\p{Diacritic}/gu, '')
-  .toLowerCase();
 
-export function wantsCatalog(text) { const t = norm(text); return /catalogo|catalogo|catálogo|ver productos|lista de precios/.test(t); }
-export function wantsLocation(text) { const t = norm(text); return /ubicacion|mapa|como llegar|donde estan/.test(t); }
-export function wantsHuman(text) { const t = norm(text); return /(asesor|humano|agente|hablar con alguien|soporte|llamar)/.test(t); }
-export function wantsClose(text) { const t = norm(text); return /(fin|terminar|gracias|chau|cerrar|finalizar)/.test(t); }
-export function wantsPrice(text) { const t = norm(text); return /(precio|cotizar|cotizacion|cotización|presupuesto)/.test(t); }
+// Normalizador
+const norm = (s = '') => s.toString().trim().toLowerCase();
+
+// ---- Detectores de intención ----
+export function wantsCatalog(text) {
+  const t = norm(text);
+  return /catalogo|catálogo|ver productos|lista de precios/.test(t);
+}
+export function wantsLocation(text) {
+  const t = norm(text);
+  return /ubicaci(ón|on)|mapa|cómo llegar|donde están|dónde están/.test(t);
+}
+export function wantsHuman(text) {
+  const t = norm(text);
+  return /(asesor|humano|agente|hablar con alguien|soporte)/.test(t);
+}
+export function wantsClose(text) {
+  const t = norm(text);
+  return /(fin|terminar|gracias|chau|cerrar|finalizar)/.test(t);
+}
+export function wantsPrice(text) {
+  const t = norm(text);
+  return /(precio|cotizar|cotizaci(ón|on)|presupuesto)/.test(t);
+}
 export function looksLikeFullName(text) {
   const t = (text ?? '').trim();
   return t.split(/\s+/).length >= 2 && /^[a-zA-ZñÑáéíóúÁÉÍÓÚ\s'.-]+$/.test(t);
 }
 
-// Catálogos / opciones
+// ===== NUEVO: trigger explícito para FAQ/IA =====
+export function wantsFAQ(text) {
+  const t = norm(text);
+  return /\b(duda|dudas|pregunta|preguntas|recomend(a|á|as)|recomendaci(ó|o)n)\b/.test(t);
+}
+
+// ---- Catálogos / opciones (USADOS por flow.js) ----
 export const DEPARTAMENTOS = [
   'Santa Cruz','Beni','Pando','La Paz','Cochabamba','Oruro','Potosí','Chuquisaca','Tarija'
 ];
+
 export const SUBZONAS_SCZ = [
   'Norte Integrado','Chiquitania','Vallegrande','Cordillera','Andrés Ibáñez','Warnes','Obispo Santistevan'
 ];
+
 export const CROP_OPTIONS = ['Soya','Maíz','Trigo','Arroz','Girasol','Otro…'];
+
 export const HA_RANGES = ['<50','50-100','100-300','300-500','>500','Otra…'];
 
-// Fuzzy helpers
-const depSyn = {
-  'santacruz':'Santa Cruz', 'scz':'Santa Cruz', 'sta cruz':'Santa Cruz', 'sta-cruz':'Santa Cruz',
-  'lapaz':'La Paz', 'lpz':'La Paz',
-  'cocha':'Cochabamba'
-};
-function eq(a,b){return norm(a)===norm(b);}
-function fuzzyIncludes(hay, needle){ return norm(hay).includes(norm(needle)); }
-
+// ---- Parsers / detectores de campos ----
 export function detectDepartamento(text) {
   const t = norm(text);
-  for (const d of DEPARTAMENTOS) if (eq(d, t)) return d;
-  // synonyms
-  for (const [k,v] of Object.entries(depSyn)) if (t.includes(k)) return v;
-  // loose include
-  for (const d of DEPARTAMENTOS) if (fuzzyIncludes(t,d)) return d;
-  return null;
+  return DEPARTAMENTOS.find(d => norm(d) === t) || null;
 }
 export function detectSubzona(text) {
   const t = norm(text);
-  for (const z of SUBZONAS_SCZ) if (eq(z, t)) return z;
-  for (const z of SUBZONAS_SCZ) if (fuzzyIncludes(t, z)) return z;
-  // alias simples
-  if (/\bwarnes\b/.test(t)) return 'Warnes';
-  if (/\bchiqui(tania)?\b/.test(t)) return 'Chiquitania';
-  return null;
+  return SUBZONAS_SCZ.find(z => norm(z) === t) || null;
 }
 export function parseHectareas(text) {
   const t = norm(text).replace(',', '.');
