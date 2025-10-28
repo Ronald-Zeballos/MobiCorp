@@ -23,10 +23,21 @@ if (PROVIDER === "groq") {
 }
 
 // ===== Parámetros (seguros) =====
-const MODEL =
-  PROVIDER === "groq"
-    ? (process.env.GROQ_MODEL || config.GROQ_MODEL || "llama-3.1-70b-versatile")
-    : (process.env.OPENAI_MODEL || config.OPENAI_MODEL || "gpt-4o-mini");
+// Mapeo deprecados Groq -> recomendados
+const GROQ_DEFAULT = "llama-3.3-70b-versatile";
+const GROQ_DEPRECATED_MAP = {
+  "llama-3.1-70b-versatile": GROQ_DEFAULT
+};
+
+function initialModel() {
+  if (PROVIDER === "groq") {
+    const wanted = process.env.GROQ_MODEL || config.GROQ_MODEL || GROQ_DEFAULT;
+    return GROQ_DEPRECATED_MAP[wanted] || wanted;
+  }
+  return process.env.OPENAI_MODEL || config.OPENAI_MODEL || "gpt-4o-mini";
+}
+
+let currentModel = initialModel();
 
 const MAX_TOKENS    = Number(process.env.AI_MAX_TOKENS || 320); // salida moderada
 const MAX_HISTORY   = Number(process.env.AI_MAX_HISTORY || 8);  // recortar historial
@@ -50,10 +61,12 @@ export async function chatIA(userText, history = []) {
   ];
 
   let attempt = 0, lastErr;
+  let switchedModelOnce = false; // evita bucles si deprecan varias veces
+
   while (attempt < RETRIES) {
     try {
       const resp = await doChat({
-        model: MODEL,
+        model: currentModel,
         messages,
         temperature: 0.4,
         max_tokens: MAX_TOKENS
@@ -62,9 +75,42 @@ export async function chatIA(userText, history = []) {
       return resp?.choices?.[0]?.message?.content?.trim() || "No pude generar respuesta.";
     } catch (err) {
       lastErr = err;
-      const status = err?.status || err?.code || 500;
+      const status = err?.status || err?.code || err?.response?.status || 500;
+      const msg = (
+        err?.error?.error?.message ||
+        err?.error?.message ||
+        err?.message ||
+        ""
+      ).toString();
 
-      // Backoff para 429/5xx (Groq y OpenAI)
+      // ---- Fallback por modelo deprecado (Groq) ----
+      // Ejemplo de mensaje: "The model `llama-3.1-70b-versatile` has been decommissioned..."
+      if (
+        PROVIDER === "groq" &&
+        !switchedModelOnce &&
+        /model/i.test(msg) &&
+        /(decommissioned|no longer supported|deprecated)/i.test(msg)
+      ) {
+        // Cambiamos al recomendado
+        switchedModelOnce = true;
+        currentModel = GROQ_DEFAULT;
+        process.env.GROQ_MODEL = currentModel; // por si lo logueas en otra parte
+        // Reintento inmediato con el nuevo modelo (sin consumir un intento)
+        try {
+          const resp2 = await doChat({
+            model: currentModel,
+            messages,
+            temperature: 0.4,
+            max_tokens: MAX_TOKENS
+          });
+          return resp2?.choices?.[0]?.message?.content?.trim() || "No pude generar respuesta.";
+        } catch (inner) {
+          lastErr = inner;
+          // Si falla, cae a manejo general abajo.
+        }
+      }
+
+      // ---- Backoff 429/5xx (Groq/OpenAI) ----
       if (status === 429 || status === 500 || status === 503) {
         const retryAfterSec =
           Number(err?.headers?.get?.("retry-after")) ||
@@ -75,7 +121,11 @@ export async function chatIA(userText, history = []) {
         attempt++;
         continue;
       }
-      throw err;
+
+      // Otros errores: avanzar intento y reintentar normal
+      attempt++;
+      await sleep(BASE_DELAY_MS);
+      continue;
     }
   }
 
