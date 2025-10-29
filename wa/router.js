@@ -5,7 +5,11 @@ import { loadSession, saveSession } from "../core/session.js";
 import { commandFromText, isMenuText,
   DEPARTAMENTOS, SUBZONAS_SCZ, CROP_OPTIONS, HA_RANGES,
   detectDepartamento, detectSubzona, parseHectareas, looksLikeFullName } from "../core/intents.js";
-import { loadCatalog, bestProductMatch } from "../core/catalog.js";
+import { loadCatalog, searchProductByText } from "../core/catalog.js";
+/** Compat: wrapper para no tocar el resto del código */
+function bestProductMatch(catalog, text) {
+  return searchProductByText(catalog, text);
+}
 import { chatIA, transcribeAudioFile } from "../src/aichat.js";
 import {
   waSendText, waSendButtons, waSendList,
