@@ -1,33 +1,33 @@
 // src/aichat.js
-// OpenAI-only: Chat y Whisper (transcripción de audio)
+// OpenAI Chat + Whisper (transcripción)
 
 import fs from "fs";
 import path from "path";
-import OpenAI from "openai";
 import { fileURLToPath } from "url";
+import OpenAI from "openai";
 import { config } from "../env.js";
 
-const client = new OpenAI({ apiKey: config.OPENAI_API_KEY });
-const MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini";
-const WHISPER_MODEL = process.env.WHISPER_MODEL || "whisper-1";
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const client = new OpenAI({ apiKey: config.OPENAI_API_KEY || process.env.OPENAI_API_KEY });
+if (!client.apiKey) throw new Error("[IA] Falta OPENAI_API_KEY");
 
-const MAX_TOKENS    = Number(process.env.AI_MAX_TOKENS || 320);
-const MAX_HISTORY   = Number(process.env.AI_MAX_HISTORY || 8);
-const RETRIES       = Number(process.env.AI_RETRIES || 3);
-const BASE_DELAY_MS = Number(process.env.AI_BASE_DELAY_MS || 800);
+const CHAT_MODEL   = process.env.OPENAI_MODEL || "gpt-4o-mini";
+const ASR_MODEL    = process.env.OPENAI_ASR_MODEL || "whisper-1";          // speech->text
+const MAX_TOKENS   = Number(process.env.AI_MAX_TOKENS || 320);
+const MAX_HISTORY  = Number(process.env.AI_MAX_HISTORY || 8);
+const RETRIES      = Number(process.env.AI_RETRIES || 3);
+const BASE_DELAY_MS= Number(process.env.AI_BASE_DELAY_MS || 800);
 
 function sleep(ms){ return new Promise(r=>setTimeout(r, ms)); }
 
-// === Chat IA (texto-tipo ChatGPT) ===
+// =============== Chat =================
 export async function chatIA(userText, history = []) {
   const hist = (history || []).slice(-MAX_HISTORY);
-
   const messages = [
     { role: "system", content:
-      "Eres AgroBot de NewChem Agroquímicos. Sé claro, breve y útil. " +
-      "Responde dudas sobre cultivos, plagas, productos y logística. " +
-      "Si no tienes el dato de precios/stock, dilo y ofrece cotizar. " +
-      "Nunca inventes precios. Tono amable y profesional para Bolivia." },
+      "Eres AgroBot de NewChem Agroquímicos. Sé claro, amable y útil. " +
+      "Responde dudas sobre cultivos, plagas, productos y logística en Bolivia. " +
+      "Si no tienes el dato de precios/stock, dilo y ofrece cotizar. No inventes precios." },
     ...hist,
     { role: "user", content: userText }
   ];
@@ -36,7 +36,7 @@ export async function chatIA(userText, history = []) {
   while (attempt < RETRIES) {
     try {
       const resp = await client.chat.completions.create({
-        model: MODEL,
+        model: CHAT_MODEL,
         messages,
         temperature: 0.4,
         max_tokens: MAX_TOKENS
@@ -45,44 +45,43 @@ export async function chatIA(userText, history = []) {
     } catch (err) {
       lastErr = err;
       const status = err?.status || err?.code || 500;
-
       if (status === 429 || status === 500 || status === 503) {
         const retryAfterSec =
           Number(err?.headers?.get?.("retry-after")) ||
           Number(err?.headers?.get?.("retry-after-ms"))/1000 || 0;
         const backoff = Math.min(8000, BASE_DELAY_MS * Math.pow(2, attempt));
-        const waitMs = Math.max(backoff, retryAfterSec * 1000);
-        await sleep(waitMs);
+        await sleep(Math.max(backoff, retryAfterSec * 1000));
         attempt++;
         continue;
       }
       throw err;
     }
   }
-  console.error("[IA] fallback:", lastErr);
-  return "La IA está ocupada ahora mismo. Intento de nuevo si me escribes otro mensaje o puedes escribir *volver* para ir al menú.";
+  console.error("[IA chat] fallback:", lastErr);
+  return "La IA está ocupada ahora mismo. Escribime de nuevo o poné *volver* para ir al menú.";
 }
 
-// === Whisper (transcripción) desde archivo en disco ===
-export async function transcribeAudioFile(filePath) {
-  const filename = path.basename(filePath);
-  const stream = fs.createReadStream(filePath);
-  const resp = await client.audio.transcriptions.create({
-    file: stream,
-    model: WHISPER_MODEL,
-    response_format: "verbose_json"
-  });
-  return resp?.text?.trim() || "";
-}
+// =============== Transcripción (Whisper) ===============
+/**
+ * transcribeAudio(buffer, filename)
+ * Devuelve { text } usando whisper-1.
+ */
+export async function transcribeAudio(buffer, filename = "audio.ogg") {
+  // guardamos temporalmente para el SDK
+  const tmpDir = path.join(__dirname, "..", "data", "tmp");
+  fs.mkdirSync(tmpDir, { recursive: true });
+  const tmpPath = path.join(tmpDir, filename);
+  fs.writeFileSync(tmpPath, buffer);
 
-// === Whisper (transcripción) desde Buffer (por si ya lo bajaste en memoria) ===
-export async function transcribeAudioBuffer(buffer, filename = "audio.ogg") {
-  // Node 18+ soporta File en el SDK
-  const file = new File([buffer], filename, { type: "application/octet-stream" });
-  const resp = await client.audio.transcriptions.create({
-    file,
-    model: WHISPER_MODEL,
-    response_format: "verbose_json"
-  });
-  return resp?.text?.trim() || "";
+  try {
+    const result = await client.audio.transcriptions.create({
+      file: fs.createReadStream(tmpPath),
+      model: ASR_MODEL, // "whisper-1"
+      // language: "es"  // opcional
+    });
+    return { text: (result?.text || "").trim() };
+  } finally {
+    // limpia archivo
+    try { fs.unlinkSync(tmpPath); } catch {}
+  }
 }
