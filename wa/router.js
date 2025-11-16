@@ -57,8 +57,8 @@ function isLikelyName(text = "") {
 }
 
 function getCatalogUrl(tipoEspacio = "") {
+  const base = "https://mobicorp.netlify.app/catalogo";
   const key = tipoEspacio.toLowerCase();
-  const base = "https://catalogo-mobicorp.netlify.app/catalogo";
   if (key.includes("oficina")) return base;
   if (key.includes("hogar")) return base;
   if (key.includes("local")) return base;
@@ -118,11 +118,10 @@ async function sendContactCard(to) {
   }
 }
 
-async function sendMainMenu(to, nombre) {
-  const saludo = nombre ? `Hola ${nombre}` : "Hola";
+async function sendMainMenu(to) {
   await waSendList(
     to,
-    `👋 ${saludo}, soy el asistente virtual de *Mobicorp*.\n¿En qué te puedo ayudar hoy?`,
+    "👋 Hola, soy el asistente virtual de *Mobicorp*.\n¿En qué te puedo ayudar hoy?",
     [
       {
         id: "menu_producto",
@@ -308,6 +307,14 @@ async function generateAndSendQuote(fromId, s) {
       fromId,
       "Listo 🙌\nTe enviamos la *cotización formal de Mobicorp en PDF*.\nSi luego querés ver alternativas o hacer ajustes, escribime por aquí y te ayudo."
     );
+    await waSendList(
+      fromId,
+      "¿Cómo querés continuar?",
+      [
+        { id: "ia_alt", title: "Ver alternativas / ajustes" },
+        { id: "ia_volver", title: "Volver al inicio" }
+      ]
+    );
   } catch (e) {
     console.error("[PDF] error", e);
     await waSendText(
@@ -376,7 +383,7 @@ router.post("/webhook", async (req, res) => {
     if (nx === "reiniciar" || nx === "reset" || nx === "inicio") {
       s = { flow: "inicio", stage: "MENU_INICIO", items: [], history: [], flags: {} };
       await waSendText(fromId, "🔄 Reinicié la conversación para una nueva atención.");
-      await sendMainMenu(fromId, null);
+      await sendMainMenu(fromId);
       saveSession(fromId, s);
       return res.sendStatus(200);
     }
@@ -485,7 +492,7 @@ router.post("/webhook", async (req, res) => {
     if (s.flow === "inicio") {
       if (!s.stage) {
         s.stage = "MENU_INICIO";
-        await sendMainMenu(fromId, s.nombre || null);
+        await sendMainMenu(fromId);
         saveSession(fromId, s);
         return res.sendStatus(200);
       }
@@ -512,7 +519,7 @@ router.post("/webhook", async (req, res) => {
             fromId,
             "Para continuar elegí una de las opciones del menú: *Saber sobre un producto* o *Solicitar una cotización*."
           );
-          await sendMainMenu(fromId, s.nombre || null);
+          await sendMainMenu(fromId);
           saveSession(fromId, s);
           return res.sendStatus(200);
         }
@@ -548,7 +555,7 @@ router.post("/webhook", async (req, res) => {
             fromId,
             "Elegí una opción de la lista o escribí *Empresa*, *Arquitecto* o *Particular*."
           );
-          await sendB2(fromId, s.nombre || "allí", { first: false });
+        await sendB2(fromId, s.nombre || "allí", { first: false });
           saveSession(fromId, s);
           return res.sendStatus(200);
         }
@@ -861,20 +868,14 @@ router.post("/webhook", async (req, res) => {
 
     if (s.flow === "ia") {
       if (s.stage === "IA_PRODUCTO") {
-        if (!textIn) {
+        if (nx === "ia_volver") {
+          s.flow = "inicio";
+          s.stage = "MENU_INICIO";
           await waSendText(
             fromId,
-            "Contame qué producto, línea de muebles o tipo de proyecto querés revisar y te asesoro."
+            "Volvimos al inicio para que puedas elegir otra opción."
           );
-          saveSession(fromId, s);
-          return res.sendStatus(200);
-        }
-
-        if (nx === "ia_continuar") {
-          await waSendText(
-            fromId,
-            "Perfecto, enviame otra consulta sobre productos, medidas, estilos o combinaciones y te sigo ayudando."
-          );
+          await sendMainMenu(fromId);
           saveSession(fromId, s);
           return res.sendStatus(200);
         }
@@ -891,11 +892,29 @@ router.post("/webhook", async (req, res) => {
           return res.sendStatus(200);
         }
 
+        if (nx === "ia_continuar") {
+          await waSendText(
+            fromId,
+            "Perfecto, enviame otra consulta sobre productos, medidas, estilos o combinaciones y te sigo ayudando."
+          );
+          saveSession(fromId, s);
+          return res.sendStatus(200);
+        }
+
+        if (!textIn) {
+          await waSendText(
+            fromId,
+            "Contame qué producto, línea de muebles o tipo de proyecto querés revisar y te asesoro."
+          );
+          saveSession(fromId, s);
+          return res.sendStatus(200);
+        }
+
         s.history.push({ role: "user", content: textIn });
         const out = await chatIA(
           textIn,
           s.history,
-          "Asesoría especializada de Mobicorp sobre mobiliario y proyectos de equipamiento de espacios. Brindar respuestas claras, profesionales y cercanas, sin comprometer precios exactos ni condiciones comerciales que no estén en el contexto."
+          "Asesoría especializada de Mobicorp sobre mobiliario y proyectos de equipamiento de espacios. Brindar respuestas claras, profesionales y cercanas, sin comprometer precios exactos ni condiciones comerciales que no estén en el contexto. Si detectas que el usuario quiere cotizar, ofrecé la opción de pasar al flujo de cotización."
         );
         s.history.push({ role: "assistant", content: out });
 
@@ -905,7 +924,8 @@ router.post("/webhook", async (req, res) => {
           "¿Cómo querés continuar?",
           [
             { id: "ia_continuar", title: "Seguir preguntando" },
-            { id: "ia_cotizar", title: "Quiero una cotización" }
+            { id: "ia_cotizar", title: "Quiero una cotización" },
+            { id: "ia_volver", title: "Volver al inicio" }
           ]
         );
         saveSession(fromId, s);
@@ -913,6 +933,27 @@ router.post("/webhook", async (req, res) => {
       }
 
       if (s.stage === "IA_ALTERNATIVAS") {
+        if (nx === "ia_volver") {
+          s.flow = "inicio";
+          s.stage = "MENU_INICIO";
+          await waSendText(
+            fromId,
+            "Volvimos al inicio para que puedas elegir otra opción."
+          );
+          await sendMainMenu(fromId);
+          saveSession(fromId, s);
+          return res.sendStatus(200);
+        }
+
+        if (nx === "ia_alt") {
+          await waSendText(
+            fromId,
+            "Perfecto, contame qué te gustaría ajustar: presupuesto, cantidad de puestos, tipo de sillas, estilos, etc."
+          );
+          saveSession(fromId, s);
+          return res.sendStatus(200);
+        }
+
         if (!textIn) {
           await waSendText(
             fromId,
@@ -932,14 +973,18 @@ router.post("/webhook", async (req, res) => {
           const out = await chatIA(
             textIn,
             s.history,
-            `El usuario ya tiene una cotización de Mobicorp con los siguientes datos:\n${context}\nProponer alternativas de configuración y combinaciones de productos, sin inventar precios exactos, manteniendo un tono profesional y cercano.`
+            `El usuario ya tiene una cotización de Mobicorp con los siguientes datos:\n${context}\nProponer alternativas de configuración y combinaciones de productos, sin inventar precios exactos, manteniendo un tono profesional y cercano. Si el usuario dice que ya está conforme, ofrecer volver al inicio.`
           );
           s.history.push({ role: "assistant", content: out });
 
           await waSendText(fromId, out);
-          await waSendText(
+          await waSendList(
             fromId,
-            "Si alguna de las alternativas te interesa, contame qué cambio te gustaría aplicar y lo adaptamos sobre tu cotización."
+            "¿Cómo querés seguir?",
+            [
+              { id: "ia_alt", title: "Seguir ajustando" },
+              { id: "ia_volver", title: "Volver al inicio" }
+            ]
           );
         }
         saveSession(fromId, s);
