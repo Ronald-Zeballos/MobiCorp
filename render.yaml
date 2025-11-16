@@ -6,3 +6,14 @@ services:
     buildCommand: "npm install"
     startCommand: "node --experimental-default-type=module server.js"
     healthCheckPath: /health
+    envVars:
+      - key: PORT
+        value: "8080"
+      - key: MONGODB_URI
+        fromSecret: mongodb-uri
+      - key: WHATSAPP_TOKEN
+        fromSecret: whatsapp-token
+      - key: WHATSAPP_NUMBER_ID
+        fromSecret: whatsapp-number-id
+      - key: OPENAI_API_KEY
+        fromSecret: openai-api-key  

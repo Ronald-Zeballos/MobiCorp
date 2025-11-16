@@ -1,31 +1,27 @@
-// src/quote.js
 import { createQuotePdf } from "./pdf.js";
 
-/**
- * buildQuote(session, phone)
- * Usa los datos de la sesión para crear un PDF de cotización Mobicorp.
- * Devuelve: { path, filename }
- */
-export async function buildQuote(session, phone) {
-  const {
-    nombre,
+export async function buildQuote(session, waId) {
+  const nombre = session.nombre || "Cliente";
+  const tipoCliente = session.tipoCliente || "-";
+  const ciudad = session.ciudad || "-";
+  const zona = session.zona || "-";
+  const tipoEspacio = session.tipoEspacio || "-";
+  const servicio = session.tipoServicio || "A definir junto al asesor";
+
+  const ubicacion = [ciudad, zona].filter(Boolean).join(" – ");
+
+  const items = (session.items || []).map((it) => ({
+    name: it.name || it.nombre || "-",
+    qty: it.qty || 1,
+    price: it.price || 0
+  }));
+
+  return createQuotePdf({
+    clienteNombre: nombre,
     tipoCliente,
-    ciudad,
-    zona,
+    ubicacion,
     tipoEspacio,
-    tipoServicio,
+    servicio,
     items
-  } = session || {};
-
-  const { path, filename } = await createQuotePdf({
-    name: nombre || phone,
-    tipoCliente: tipoCliente || "-",
-    ciudad: ciudad || "-",
-    zona: zona || "-",
-    tipoEspacio: tipoEspacio || "-",
-    tipoServicio: tipoServicio || "-",
-    items: items || []
   });
-
-  return { path, filename };
 }
