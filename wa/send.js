@@ -132,12 +132,26 @@ export function waSendDocument(to, mediaId, filename = "archivo.pdf", caption = 
   return enqueue(() => postJSON(url, payload));
 }
 
+// 🔊 NUEVO: enviar audio (respuesta de IA en mp3)
+export function waSendAudio(to, mediaId) {
+  if (!assertCreds()) return Promise.resolve(false);
+  const url = `${GRAPH_BASE}/${PHONE_ID}/messages`;
+  const payload = {
+    messaging_product: "whatsapp",
+    to,
+    type: "audio",
+    audio: { id: mediaId }
+  };
+  if (config.DEBUG_LOGS) console.log("[WA -> audio]", to, mediaId);
+  return enqueue(() => postJSON(url, payload));
+}
+
 // ======================================================
 // =============== Upload de media local ===============
 // ======================================================
 /**
  * Sube un archivo local (imagen/pdf/audio) al media endpoint de WhatsApp
- * y devuelve el mediaId para usar con waSendImage/waSendDocument.
+ * y devuelve el mediaId para usar con waSendImage/waSendDocument/waSendAudio.
  *
  * @param {string} filePath - ruta absoluta o relativa
  * @param {string} mimeType - ej: "image/jpeg"
