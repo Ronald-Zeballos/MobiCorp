@@ -33,3 +33,6 @@ app.listen(PORT, '0.0.0.0', () => {
   if (config.DEBUG_LOGS) console.log('[BOOT] DEBUG_LOGS enabled');
   if (!config.WHATSAPP_TOKEN) console.warn('[WARN] WHATSAPP_TOKEN is not set. Outbound messages will fail.');
 });
+// --- IGNORE ---
+// End of file
+// --- IGNORE ---//
