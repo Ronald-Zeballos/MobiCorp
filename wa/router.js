@@ -7,10 +7,11 @@ import {
   waSendText,
   waSendList,
   waSendDocument,
-  waUploadMediaFromFile
+  waUploadMediaFromFile,
+  waSendAudio
 } from "./send.js";
 import { buildQuote } from "../src/quote.js";
-import { chatIA, transcribeAudio } from "../src/aichat.js";
+import { chatIA, transcribeAudio, synthesizeSpeech } from "../src/aichat.js";
 import { parseCartFromText } from "../src/parse.js";
 
 // ======== Config WhatsApp ========
@@ -29,7 +30,6 @@ function humanTotal(subtotal) {
   return `Bs ${s}`;
 }
 
-// detecta “hola”, “buenas”, etc.
 function isGreeting(text = "") {
   const t = normalize(text);
   if (!t) return false;
@@ -42,19 +42,17 @@ function isGreeting(text = "") {
     "buen día",
     "buenas tardes",
     "buenas noches",
-    "qué tal",
     "que tal",
+    "qué tal",
     "hey",
     "ola"
   ].some((g) => t === g || t.startsWith(g + " "));
 }
 
-// Nombre más o menos razonable (no 1 letra, no solo saludo)
 function isLikelyName(text = "") {
   const t = text.trim();
   if (t.length < 3) return false;
   if (isGreeting(t)) return false;
-  // al menos dos palabras o una palabra medio larga
   const parts = t.split(/\s+/);
   if (parts.length >= 2) return true;
   return t.length >= 4;
@@ -91,7 +89,7 @@ async function downloadWaMedia(mediaId) {
   return buf;
 }
 
-// Enviar tarjeta de contacto (Hablar con un ejecutivo)
+// Enviar contacto de ejecutivo
 async function sendContactCard(to) {
   const name = config.ADVISOR_NAME || "Equipo Mobicorp";
   const role = config.ADVISOR_ROLE || "Asesor Comercial";
@@ -130,38 +128,42 @@ async function sendContactCard(to) {
   }
 }
 
-// ======== Mensajes de flujo ========
+// ======== Mensajes de flujo B1–B6 ========
 
 async function sendB1(to) {
   await waSendText(
     to,
-    "👋 ¡Hola! Soy el asistente virtual de *Mobicorp*.\nTe ayudo a cotizar muebles para tu proyecto.\n\nPara empezar, ¿cuál es tu *nombre completo*? (Ej: Juan Pérez)"
+    "👋 ¡Hola! Soy el asistente virtual de *Mobicorp*.\nTe ayudo a cotizar muebles para tu proyecto.\n\nPara empezar, ¿cuál es tu *nombre completo* (nombre y apellido)?"
   );
 }
 
-// primer intento vs repetición
 async function sendB2(to, nombre, { first = false } = {}) {
   const prefix = first ? `Gracias, ${nombre} 😊\n` : "";
-  await waSendList(
-    to,
-    `${prefix}¿Nos escribís como…?`,
-    [
-      { id: "tipo_empresa", title: "Empresa" },
-      { id: "tipo_arquitecto", title: "Arquitecto / Diseñador" },
-      { id: "tipo_particular", title: "Particular" }
-    ]
-  );
+  await waSendList(to, `${prefix}¿Nos escribís como…?`, [
+    { id: "tipo_empresa", title: "Empresa" },
+    { id: "tipo_arquitecto", title: "Arquitecto / Diseñador" },
+    { id: "tipo_particular", title: "Particular" }
+  ]);
 }
 
 async function sendB3(to) {
+  await waSendList(to, "¿De qué *departamento* de Bolivia nos escribís?", [
+    { id: "dpto_sc", title: "Santa Cruz" },
+    { id: "dpto_lp", title: "La Paz" },
+    { id: "dpto_cbba", title: "Cochabamba" },
+    { id: "dpto_otro", title: "Otro" }
+  ]);
+}
+
+async function sendSCZoneMenu(to) {
   await waSendList(
     to,
-    "¿Desde qué *ciudad / departamento* de Bolivia nos escribís?",
+    "¿En qué *zona de Santa Cruz* estás?",
     [
-      { id: "ciudad_sc", title: "Santa Cruz" },
-      { id: "ciudad_lp", title: "La Paz" },
-      { id: "ciudad_cbba", title: "Cochabamba" },
-      { id: "ciudad_otro", title: "Otro" }
+      { id: "scz_norte", title: "Norte" },
+      { id: "scz_sur", title: "Sur" },
+      { id: "scz_este", title: "Este" },
+      { id: "scz_oeste", title: "Oeste" }
     ]
   );
 }
@@ -185,8 +187,8 @@ function renderProductosDetalle(items = []) {
   return items
     .map((it) => {
       const qty = it.qty || 1;
-      const unit = it.price ? `Bs ${it.price.toFixed(2)}` : "sin precio";
-      const sub = it.price ? ` → Bs ${(it.price * qty).toFixed(2)}` : "";
+      const unit = it.price ? `Bs ${Number(it.price).toFixed(2)}` : "sin precio";
+      const sub = it.price ? ` → Bs ${(qty * it.price).toFixed(2)}` : "";
       return `• ${it.name} x${qty} (${unit})${sub}`;
     })
     .join("\n");
@@ -221,9 +223,8 @@ router.post("/webhook", async (req, res) => {
     s.stage = s.stage || null;
     s.items = s.items || [];
     s.history = s.history || [];
-    s.flags = s.flags || {}; // banderas para validaciones
+    s.flags = s.flags || {};
 
-    // perfil de WhatsApp para usar como default de nombre
     const profileName = value?.contacts?.[0]?.profile?.name;
     if (!s.nombre && profileName && isLikelyName(profileName)) {
       s.nombre = profileName.trim();
@@ -243,16 +244,13 @@ router.post("/webhook", async (req, res) => {
     // ===== Comandos rápidos =====
     if (nx === "reiniciar" || nx === "reset" || nx === "inicio") {
       s = { flow: "inicio", stage: null, items: [], history: [], flags: {} };
-      await waSendText(
-        fromId,
-        "🔄 Reinicié la conversación para una nueva cotización."
-      );
+      await waSendText(fromId, "🔄 Reinicié la conversación para una nueva cotización.");
       await sendB1(fromId);
       saveSession(fromId, s);
       return res.sendStatus(200);
     }
 
-    // ===== AUDIO/VOICE → Whisper + IA (no rompe flujo) =====
+    // ===== AUDIO/VOICE -> Whisper + TTS =====
     if (type === "audio" || type === "voice") {
       const mediaId = msg.audio?.id || msg.voice?.id;
       try {
@@ -263,13 +261,39 @@ router.post("/webhook", async (req, res) => {
           const out = await chatIA(
             text,
             s.history,
-            "El usuario envía su consulta por audio mientras está cotizando muebles con Mobicorp."
+            "Respuesta de soporte para un cliente de Mobicorp que consulta por voz."
           );
           s.history.push({ role: "assistant", content: out });
+
+          // Texto + audio respuesta
           await waSendText(
             fromId,
-            `🗣️ *Transcripción de tu audio:*\n"${text}"\n\n${out}`
+            `🗣️ Te escuché decir:\n"${text}"\n\nTe respondo también en audio 👇`
           );
+
+          try {
+            const speech = await synthesizeSpeech(
+              out,
+              `mobicorp_${Date.now()}.mp3`
+            );
+            if (speech?.path) {
+              const mediaOut = await waUploadMediaFromFile(
+                speech.path,
+                "audio/mpeg",
+                speech.filename
+              );
+              if (mediaOut) {
+                await waSendAudio(fromId, mediaOut);
+              } else {
+                await waSendText(fromId, out);
+              }
+            } else {
+              await waSendText(fromId, out);
+            }
+          } catch (e) {
+            console.error("[TTS] error", e);
+            await waSendText(fromId, out);
+          }
         } else {
           await waSendText(
             fromId,
@@ -287,15 +311,13 @@ router.post("/webhook", async (req, res) => {
       return res.sendStatus(200);
     }
 
-    // ===== Detectar carrito pegado desde la web (entrada C1) =====
+    // ===== Intentar detectar carrito pegado (catálogo web) =====
     let parsedCart = null;
     if (type === "text" && textIn && s.stage !== "B1") {
-      // solo intentamos parsear carrito si ya pasamos B1 (para no confundir el nombre con carrito)
       parsedCart = parseCartFromText(textIn);
     }
 
     if (parsedCart && parsedCart.items.length) {
-      // Arranca flujo "Desde catálogo web"
       s.flow = "catalog";
       s.stage = "C1";
       s.items = parsedCart.items;
@@ -318,9 +340,11 @@ router.post("/webhook", async (req, res) => {
       return res.sendStatus(200);
     }
 
-    // ================= FLUJO 1: INICIO WHATSAPP (B1–B6) =================
+    // ===========================================================
+    // FLUJO 1: INICIO WHATSAPP (B1–B6)
+    // ===========================================================
     if (s.flow === "inicio") {
-      // Si no hay etapa, empezamos en B1
+      // B1: saludo inicial
       if (!s.stage) {
         s.stage = "B1";
         await sendB1(fromId);
@@ -333,7 +357,7 @@ router.post("/webhook", async (req, res) => {
         if (!textIn) {
           await waSendText(
             fromId,
-            "Decime tu *nombre completo* para avanzar, por favor. (Ej: María García)"
+            "Decime tu *nombre completo* para avanzar, por favor (nombre y apellido)."
           );
           saveSession(fromId, s);
           return res.sendStatus(200);
@@ -342,7 +366,7 @@ router.post("/webhook", async (req, res) => {
         if (!isLikelyName(textIn)) {
           await waSendText(
             fromId,
-            "Para continuar necesito tu *nombre completo* (nombre y apellido). Ejemplo: *Juan Pérez*."
+            "Para continuar necesito tu *nombre completo* (nombre y apellido)."
           );
           saveSession(fromId, s);
           return res.sendStatus(200);
@@ -350,9 +374,7 @@ router.post("/webhook", async (req, res) => {
 
         s.nombre = textIn.trim().replace(/\s+/g, " ");
         s.stage = "B2";
-        s.flags.b2Welcomed = false;
         await sendB2(fromId, s.nombre, { first: true });
-        s.flags.b2Welcomed = true;
         saveSession(fromId, s);
         return res.sendStatus(200);
       }
@@ -371,34 +393,65 @@ router.post("/webhook", async (req, res) => {
 
         if (nx === "tipo_empresa" || textIn.toLowerCase().includes("empresa")) {
           s.tipoCliente = "Empresa";
-        } else if (
+          s.stage = "B2_EMPRESA";
+          await waSendText(
+            fromId,
+            "Perfecto 👌\n¿De qué *empresa* nos escribís?"
+          );
+          saveSession(fromId, s);
+          return res.sendStatus(200);
+        }
+
+        if (
           nx === "tipo_arquitecto" ||
           textIn.toLowerCase().includes("arquitect") ||
           textIn.toLowerCase().includes("diseñador")
         ) {
           s.tipoCliente = "Arquitecto / Diseñador";
-        } else if (
-          nx === "tipo_particular" ||
-          textIn.toLowerCase().includes("particular")
-        ) {
-          s.tipoCliente = "Particular";
-        } else {
-          await waSendText(
-            fromId,
-            "No identifiqué el tipo de cliente. Escribí *Empresa*, *Arquitecto / Diseñador* o *Particular*, o usá el botón *Elegir*."
-          );
-          await sendB2(fromId, s.nombre || "allí", { first: false });
+          s.stage = "B3";
+          await sendB3(fromId);
           saveSession(fromId, s);
           return res.sendStatus(200);
         }
 
+        if (
+          nx === "tipo_particular" ||
+          textIn.toLowerCase().includes("particular")
+        ) {
+          s.tipoCliente = "Particular";
+          s.stage = "B3";
+          await sendB3(fromId);
+          saveSession(fromId, s);
+          return res.sendStatus(200);
+        }
+
+        await waSendText(
+          fromId,
+          "No identifiqué el tipo de cliente. Escribí *Empresa*, *Arquitecto / Diseñador* o *Particular*, o usá el botón *Elegir*."
+        );
+        await sendB2(fromId, s.nombre || "allí", { first: false });
+        saveSession(fromId, s);
+        return res.sendStatus(200);
+      }
+
+      // ---------- B2_EMPRESA: nombre de empresa ----------
+      if (s.stage === "B2_EMPRESA") {
+        if (!textIn || isGreeting(textIn)) {
+          await waSendText(
+            fromId,
+            "Decime el *nombre de la empresa* para poder registrar la cotización 🙂"
+          );
+          saveSession(fromId, s);
+          return res.sendStatus(200);
+        }
+        s.nombreEmpresa = textIn.trim();
         s.stage = "B3";
         await sendB3(fromId);
         saveSession(fromId, s);
         return res.sendStatus(200);
       }
 
-      // ---------- B3: ciudad ----------
+      // ---------- B3: departamento ----------
       if (s.stage === "B3") {
         if (!textIn) {
           await sendB3(fromId);
@@ -406,37 +459,55 @@ router.post("/webhook", async (req, res) => {
           return res.sendStatus(200);
         }
 
-        if (isGreeting(textIn)) {
-          await waSendText(
-            fromId,
-            "Para seguir necesito saber desde qué *ciudad / departamento* de Bolivia nos escribís (por ejemplo: Santa Cruz)."
-          );
-          await sendB3(fromId);
+        if (nx === "dpto_sc" || textIn.toLowerCase().includes("santa cruz")) {
+          s.departamento = "Santa Cruz";
+          s.ciudad = "Santa Cruz de la Sierra";
+          s.stage = "B3_SCZ";
+          await sendSCZoneMenu(fromId);
           saveSession(fromId, s);
           return res.sendStatus(200);
         }
 
-        if (nx === "ciudad_sc" || textIn.toLowerCase().includes("santa cruz")) {
-          s.ciudad = "Santa Cruz";
-        } else if (nx === "ciudad_lp" || textIn.toLowerCase().includes("la paz")) {
+        if (nx === "dpto_lp" || textIn.toLowerCase().includes("la paz")) {
+          s.departamento = "La Paz";
           s.ciudad = "La Paz";
-        } else if (
-          nx === "ciudad_cbba" ||
+          s.stage = "B4";
+          await waSendText(
+            fromId,
+            "¿En qué *zona o barrio* de La Paz estás?"
+          );
+          saveSession(fromId, s);
+          return res.sendStatus(200);
+        }
+
+        if (
+          nx === "dpto_cbba" ||
           textIn.toLowerCase().includes("cochabamba")
         ) {
+          s.departamento = "Cochabamba";
           s.ciudad = "Cochabamba";
-        } else if (nx === "ciudad_otro") {
+          s.stage = "B4";
           await waSendText(
             fromId,
-            "Perfecto, ¿de qué ciudad nos escribís? Ej: Tarija, Sucre, Potosí…"
+            "¿En qué *zona o barrio* de Cochabamba estás?"
           );
-          s.stage = "B3_WAIT_OTHER";
           saveSession(fromId, s);
           return res.sendStatus(200);
-        } else {
-          s.ciudad = textIn.trim();
         }
 
+        if (nx === "dpto_otro") {
+          s.stage = "B3_WAIT_OTHER";
+          await waSendText(
+            fromId,
+            "Perfecto, ¿de qué *departamento* de Bolivia nos escribís?"
+          );
+          saveSession(fromId, s);
+          return res.sendStatus(200);
+        }
+
+        // Texto libre → lo tomamos como departamento
+        s.departamento = textIn.trim();
+        s.ciudad = s.departamento;
         s.stage = "B4";
         await waSendText(
           fromId,
@@ -446,20 +517,63 @@ router.post("/webhook", async (req, res) => {
         return res.sendStatus(200);
       }
 
+      // ---------- B3_WAIT_OTHER ----------
       if (s.stage === "B3_WAIT_OTHER") {
         if (!textIn || isGreeting(textIn)) {
           await waSendText(
             fromId,
-            "Decime el nombre de tu ciudad para poder ubicar mejor la propuesta 🙂"
+            "Decime el nombre del *departamento* para poder seguir 🙂"
           );
           saveSession(fromId, s);
           return res.sendStatus(200);
         }
-        s.ciudad = textIn.trim();
+        s.departamento = textIn.trim();
+        s.ciudad = s.departamento;
         s.stage = "B4";
         await waSendText(
           fromId,
           `¿En qué *zona o barrio* de ${s.ciudad} estás?`
+        );
+        saveSession(fromId, s);
+        return res.sendStatus(200);
+      }
+
+      // ---------- B3_SCZ: zona macrorregión de Santa Cruz ----------
+      if (s.stage === "B3_SCZ") {
+        if (
+          nx === "scz_norte" ||
+          textIn.toLowerCase().includes("norte")
+        ) {
+          s.zonaMacro = "Norte";
+        } else if (
+          nx === "scz_sur" ||
+          textIn.toLowerCase().includes("sur")
+        ) {
+          s.zonaMacro = "Sur";
+        } else if (
+          nx === "scz_este" ||
+          textIn.toLowerCase().includes("este")
+        ) {
+          s.zonaMacro = "Este";
+        } else if (
+          nx === "scz_oeste" ||
+          textIn.toLowerCase().includes("oeste")
+        ) {
+          s.zonaMacro = "Oeste";
+        } else {
+          await waSendText(
+            fromId,
+            "Elegí una de las zonas: Norte, Sur, Este u Oeste."
+          );
+          await sendSCZoneMenu(fromId);
+          saveSession(fromId, s);
+          return res.sendStatus(200);
+        }
+
+        s.stage = "B4";
+        await waSendText(
+          fromId,
+          `Genial. ¿En qué *barrio o zona específica* de Santa Cruz (${s.zonaMacro}) estás?`
         );
         saveSession(fromId, s);
         return res.sendStatus(200);
@@ -468,15 +582,22 @@ router.post("/webhook", async (req, res) => {
       // ---------- B4: zona/barrio ----------
       if (s.stage === "B4") {
         if (!textIn || isGreeting(textIn)) {
+          const ciudadLabel = s.ciudad || s.departamento || "tu ciudad";
           await waSendText(
             fromId,
-            `Decime en qué *zona o barrio* de ${s.ciudad} estás. Ej: Equipetrol, Centro, Sur…`
+            `Decime en qué *zona o barrio* de ${ciudadLabel} estás. Ej: Equipetrol, Centro, Sur…`
           );
           saveSession(fromId, s);
           return res.sendStatus(200);
         }
 
-        s.zona = textIn.trim();
+        const barrio = textIn.trim();
+        if (s.zonaMacro) {
+          s.zona = `${s.zonaMacro} - ${barrio}`;
+        } else {
+          s.zona = barrio;
+        }
+
         s.stage = "B5";
         await sendB5(fromId);
         saveSession(fromId, s);
@@ -491,25 +612,27 @@ router.post("/webhook", async (req, res) => {
           return res.sendStatus(200);
         }
 
-        if (nx === "esp_oficina" || textIn.toLowerCase().includes("oficina")) {
+        const lower = textIn.toLowerCase();
+
+        if (nx === "esp_oficina" || lower.includes("oficina")) {
           s.tipoEspacio = "Oficina";
-        } else if (nx === "esp_hogar" || textIn.toLowerCase().includes("hogar")) {
+        } else if (nx === "esp_hogar" || lower.includes("hogar")) {
           s.tipoEspacio = "Hogar";
-        } else if (nx === "esp_local" || textIn.toLowerCase().includes("local")) {
+        } else if (nx === "esp_local" || lower.includes("local")) {
           s.tipoEspacio = "Local comercial / tienda";
         } else if (
           nx === "esp_consultorio" ||
-          textIn.toLowerCase().includes("consultorio") ||
-          textIn.toLowerCase().includes("clinica") ||
-          textIn.toLowerCase().includes("clínica")
+          lower.includes("consultorio") ||
+          lower.includes("clinica") ||
+          lower.includes("clínica")
         ) {
           s.tipoEspacio = "Consultorio / clínica";
         } else if (nx === "esp_otro") {
+          s.stage = "B5_WAIT_OTHER";
           await waSendText(
             fromId,
             "Contame brevemente qué tipo de espacio es (ej: sala de reuniones, cowork, recepción, sala de espera…)."
           );
-          s.stage = "B5_WAIT_OTHER";
           saveSession(fromId, s);
           return res.sendStatus(200);
         } else if (isGreeting(textIn)) {
@@ -528,11 +651,10 @@ router.post("/webhook", async (req, res) => {
         const url = getCatalogUrl(s.tipoEspacio);
         const msgCatalogo =
           url && url.startsWith("http")
-            ? `Perfecto, ${s.nombre}.\nTe comparto nuestro catálogo web para *${s.tipoEspacio}*:\n${url}\n\nAhí podés ver modelos, precios y elegir cantidades.\n\nCuando termines tu selección, en la web tocá el botón *“Enviar a WhatsApp / Solicitar cotización”* y seguimos por acá con tu cotización automática ✅`
-            : `Perfecto, ${s.nombre}.\n\nTe comparto nuestro catálogo web para *${s.tipoEspacio}* (pedí el link a tu ejecutivo si aún no lo tenés).\n\nCuando termines tu selección, tocá el botón *“Enviar a WhatsApp / Solicitar cotización”* y seguimos por acá con tu cotización automática ✅`;
-
+            ? `Perfecto, ${s.nombre}.\nTe comparto nuestro *catálogo web* para *${s.tipoEspacio}*:\n${url}\n\nAhí podés ver modelos, precios y elegir cantidades.\n\nCuando termines tu selección, en la web tocá el botón *“Enviar a WhatsApp / Solicitar cotización”* y seguimos por acá con tu cotización automática ✅`
+            : `Perfecto, ${s.nombre}.\n\nTe comparto nuestro catálogo web para *${s.tipoEspacio}*. Cuando termines tu selección, tocá el botón *“Enviar a WhatsApp / Solicitar cotización”* y seguimos por acá con tu cotización automática ✅`;
         await waSendText(fromId, msgCatalogo);
-        s.stage = "B6_WAIT_WEB"; // esperamos carrito desde la web
+        s.stage = "B6_WAIT_WEB";
         saveSession(fromId, s);
         return res.sendStatus(200);
       }
@@ -551,15 +673,14 @@ router.post("/webhook", async (req, res) => {
         const url = getCatalogUrl(s.tipoEspacio);
         const msgCatalogo =
           url && url.startsWith("http")
-            ? `Perfecto, ${s.nombre}.\nTe comparto nuestro catálogo web para *${s.tipoEspacio}*:\n${url}\n\nAhí podés ver modelos, precios y elegir cantidades.\n\nCuando termines tu selección, en la web tocá el botón *“Enviar a WhatsApp / Solicitar cotización”* y seguimos por acá con tu cotización automática ✅`
-            : `Perfecto, ${s.nombre}.\n\nTe comparto nuestro catálogo web para *${s.tipoEspacio}* (pedí el link a tu ejecutivo si aún no lo tenés).\n\nCuando termines tu selección, tocá el botón *“Enviar a WhatsApp / Solicitar cotización”* y seguimos por acá con tu cotización automática ✅`;
+            ? `Perfecto, ${s.nombre}.\nTe comparto nuestro *catálogo web* para *${s.tipoEspacio}*:\n${url}\n\nAhí podés ver modelos, precios y elegir cantidades.\n\nCuando termines tu selección, en la web tocá el botón *“Enviar a WhatsApp / Solicitar cotización”* y seguimos por acá con tu cotización automática ✅`
+            : `Perfecto, ${s.nombre}.\n\nTe comparto nuestro catálogo web para *${s.tipoEspacio}*. Cuando termines tu selección, tocá el botón *“Enviar a WhatsApp / Solicitar cotización”* y seguimos por acá con tu cotización automática ✅`;
         await waSendText(fromId, msgCatalogo);
         s.stage = "B6_WAIT_WEB";
         saveSession(fromId, s);
         return res.sendStatus(200);
       }
 
-      // B6_WAIT_WEB: básicamente esperamos que llegue el carrito pegado
       if (s.stage === "B6_WAIT_WEB") {
         await waSendText(
           fromId,
@@ -570,9 +691,11 @@ router.post("/webhook", async (req, res) => {
       }
     }
 
-    // ================= FLUJO 2: DESDE CATÁLOGO WEB (C1–C5) =================
+    // ===========================================================
+    // FLUJO 2: DESDE CATÁLOGO WEB (C1–C5)
+    // ===========================================================
     if (s.flow === "catalog") {
-      // C1 ya se maneja cuando detectamos el carrito (arriba)
+      // C1 ya se disparó al detectar carrito
       if (s.stage === "C1") {
         if (nx === "cart_ok") {
           s.stage = "C2";
@@ -727,10 +850,12 @@ router.post("/webhook", async (req, res) => {
 
         // pasar a C4
         s.stage = "C4";
-        const total = s.subtotalPreliminar || s.items.reduce(
-          (acc, it) => acc + ((it.price || 0) * (it.qty || 1)),
-          0
-        );
+        const total =
+          s.subtotalPreliminar ||
+          s.items.reduce(
+            (acc, it) => acc + ((it.price || 0) * (it.qty || 1)),
+            0
+          );
         s.totalCalculado = total;
 
         const detalle = renderProductosDetalle(s.items);
@@ -788,19 +913,19 @@ router.post("/webhook", async (req, res) => {
         }
       }
 
-      // C5: generar y enviar PDF + opciones finales
+      // C5: generar PDF + alternativas / ejecutivo
       if (s.stage === "C5") {
         try {
           const { path: pdfPath, filename } = await buildQuote(s, fromId);
-          const mediaId = await waUploadMediaFromFile(
+          const mediaIdOut = await waUploadMediaFromFile(
             pdfPath,
             "application/pdf",
             filename
           );
-          if (mediaId) {
+          if (mediaIdOut) {
             await waSendDocument(
               fromId,
-              mediaId,
+              mediaIdOut,
               filename,
               "🧾 Tu cotización formal de Mobicorp está lista."
             );
@@ -854,7 +979,9 @@ router.post("/webhook", async (req, res) => {
       }
     }
 
-    // ================= FLUJO 3: IA (alternativas o dudas sueltas) =================
+    // ===========================================================
+    // FLUJO 3: IA (alternativas o dudas sueltas)
+    // ===========================================================
     if (s.flow === "ia") {
       if (s.stage === "IA_ALTERNATIVAS") {
         if (!textIn) {
@@ -876,7 +1003,7 @@ router.post("/webhook", async (req, res) => {
           const out = await chatIA(
             textIn,
             s.history,
-            `El usuario ya tiene una cotización de Mobicorp con los datos siguientes:\n${context}\nDebe proponer alternativas de productos/configuraciones, pero sin inventar precios exactos.`
+            `El usuario ya tiene una cotización de Mobicorp con los datos siguientes:\n${context}\nDebe proponer alternativas de productos/configuraciones, sin inventar precios exactos.`
           );
           s.history.push({ role: "assistant", content: out });
 
@@ -891,7 +1018,7 @@ router.post("/webhook", async (req, res) => {
       }
     }
 
-    // ===== Si nada matchea, contención básica =====
+    // ===== Fallback =====
     await waSendText(
       fromId,
       "Te ayudo a cotizar muebles para tu proyecto. Podés escribir *reiniciar* para empezar una nueva cotización o reenviar tu selección desde el catálogo web."
