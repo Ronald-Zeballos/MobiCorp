@@ -13,6 +13,7 @@ import {
 import { buildQuote } from "../src/quote.js";
 import { chatIA, transcribeAudio, synthesizeSpeech } from "../src/aichat.js";
 import { parseCartFromText } from "../src/parse.js";
+import { djangoFillCartPrices, djangoSendOrder } from "../core/django.js";
 
 // ======== Config WhatsApp ========
 const GRAPH_BASE = "https://graph.facebook.com/v20.0";
@@ -89,7 +90,7 @@ async function downloadWaMedia(mediaId) {
   return buf;
 }
 
-// Enviar contacto de ejecutivo
+// Enviar contacto de ejecutivo (lo seguimos teniendo por si lo usas luego)
 async function sendContactCard(to) {
   const name = config.ADVISOR_NAME || "Equipo Mobicorp";
   const role = config.ADVISOR_ROLE || "Asesor Comercial";
@@ -317,24 +318,97 @@ router.post("/webhook", async (req, res) => {
       parsedCart = parseCartFromText(textIn);
     }
 
+    // === NUEVO FLUJO SIMPLE DE CATÁLOGO: resumen -> PDF -> backend ===
     if (parsedCart && parsedCart.items.length) {
       s.flow = "catalog";
-      s.stage = "C1";
+      s.stage = "C_AUTO";
       s.items = parsedCart.items;
       s.subtotalPreliminar = parsedCart.subtotal;
       s.rawCartText = textIn;
 
-      const nombre = s.nombre || "allí";
-      await waSendText(
-        fromId,
-        `👋 ¡Hola ${nombre}!\nRecibí tu selección desde el *catálogo web de Mobicorp* 👌\n\nEsto es lo que elegiste:\n${renderProductosDetalle(
-          s.items
-        )}\n\n¿Está correcto tu listado?`
-      );
-      await waSendList(fromId, "Confirmá tu listado:", [
-        { id: "cart_ok", title: "Sí, está correcto" },
-        { id: "cart_fix", title: "Quiero corregir algo" }
-      ]);
+      // 1) Completar precios desde Django
+      try {
+        await djangoFillCartPrices(s, fromId);
+      } catch (e) {
+        console.error("[DJANGO prices] error:", e);
+      }
+
+      // 2) Calcular total
+      const total =
+        s.subtotalPreliminar ||
+        s.items.reduce(
+          (acc, it) => acc + ((it.price || 0) * (it.qty || 1)),
+          0
+        );
+      s.totalCalculado = total;
+
+      const detalle = renderProductosDetalle(s.items);
+      const nombre = s.nombre || "Cliente";
+
+      // 3) Enviar resumen
+      const texto = [
+        `Perfecto, ${nombre}.`,
+        "Con la información que nos diste, esta es tu *cotización preliminar*:",
+        "",
+        "COTIZACIÓN MOBICORP",
+        `Cliente: ${nombre} – ${s.tipoCliente || "-"}`,
+        `Ciudad / zona: ${s.ciudad || "-"} – ${s.zona || "-"}`,
+        `Espacio: ${s.tipoEspacio || "-"}`,
+        "",
+        "Productos:",
+        detalle,
+        "",
+        `TOTAL APROXIMADO: ${humanTotal(total)}`,
+        "(Referencial, sujeto a stock y verificación.)",
+        "",
+        "Te envío ahora la *cotización formal en PDF* con estos datos ✅"
+      ].join("\n");
+
+      await waSendText(fromId, texto);
+
+      // 4) Generar PDF + enviar a WhatsApp + notificar a Django
+      try {
+        const { path: pdfPath, filename, quoteId } = await buildQuote(s, fromId);
+
+        const mediaIdOut = await waUploadMediaFromFile(
+          pdfPath,
+          "application/pdf",
+          filename
+        );
+        if (mediaIdOut) {
+          await waSendDocument(
+            fromId,
+            mediaIdOut,
+            filename,
+            "🧾 Tu cotización formal de Mobicorp está lista."
+          );
+        }
+
+        // Enviar pedido al backend
+        try {
+          await djangoSendOrder(s, fromId, {
+            pdfFilename: filename,
+            quoteId: quoteId || null
+          });
+        } catch (e) {
+          console.error("[DJANGO order] error:", e);
+        }
+
+        await waSendText(
+          fromId,
+          "Listo 🙌\nTe enviamos la *cotización formal en PDF*.\nSi querés ver alternativas o ajustar algo, escribime qué querés cambiar o mandame un audio y te ayudo."
+        );
+
+        // Pasar a modo IA para alternativas / dudas
+        s.flow = "ia";
+        s.stage = "IA_ALTERNATIVAS";
+      } catch (e) {
+        console.error("[PDF] error", e);
+        await waSendText(
+          fromId,
+          "No pude generar el PDF ahora mismo. ¿Te parece si lo intento nuevamente en un momento?"
+        );
+      }
 
       saveSession(fromId, s);
       return res.sendStatus(200);
@@ -673,7 +747,7 @@ router.post("/webhook", async (req, res) => {
         const url = getCatalogUrl(s.tipoEspacio);
         const msgCatalogo =
           url && url.startsWith("http")
-            ? `Perfecto, ${s.nombre}.\nTe comparto nuestro *catálogo web* para *${s.tipoEspacio}*:\n${url}\n\nAhí podés ver modelos, precios y elegir cantidades.\n\nCuando termines tu selección, en la web tocá el botón *“Enviar a WhatsApp / Solicitar cotización”* y seguimos por acá con tu cotización automática ✅`
+            ? `Perfecto, ${s.nombre}.\nTe comparto nuestro *catálogo web* para *${s.tipoEspacio}*:\n${url}\n\nAhí podés ver modelos, precios y elegir cantidades.\n\nCuando termines tu selección, tocá el botón *“Enviar a WhatsApp / Solicitar cotización”* y seguimos por acá con tu cotización automática ✅`
             : `Perfecto, ${s.nombre}.\n\nTe comparto nuestro catálogo web para *${s.tipoEspacio}*. Cuando termines tu selección, tocá el botón *“Enviar a WhatsApp / Solicitar cotización”* y seguimos por acá con tu cotización automática ✅`;
         await waSendText(fromId, msgCatalogo);
         s.stage = "B6_WAIT_WEB";
@@ -686,294 +760,6 @@ router.post("/webhook", async (req, res) => {
           fromId,
           "Cuando termines en el catálogo, tocá *“Enviar a WhatsApp / Solicitar cotización”* y acá voy a leer automáticamente tu selección 🙌"
         );
-        saveSession(fromId, s);
-        return res.sendStatus(200);
-      }
-    }
-
-    // ===========================================================
-    // FLUJO 2: DESDE CATÁLOGO WEB (C1–C5)
-    // ===========================================================
-    if (s.flow === "catalog") {
-      // C1 ya se disparó al detectar carrito
-      if (s.stage === "C1") {
-        if (nx === "cart_ok") {
-          s.stage = "C2";
-          await waSendText(
-            fromId,
-            `Para confirmar, tengo estos datos:\nCiudad: ${s.ciudad || "-"}\nZona/barrio: ${s.zona || "-"}\n\n¿Es correcto?`
-          );
-          await waSendList(fromId, "Confirmá tu ubicación:", [
-            { id: "loc_ok", title: "Sí, es correcto" },
-            { id: "loc_change", title: "No, cambiar ubicación" }
-          ]);
-        } else if (nx === "cart_fix") {
-          s.stage = "C1_WAIT_NEW_CART";
-          await waSendText(
-            fromId,
-            "Perfecto, podés corregir tu selección en el catálogo y volver a tocar *“Enviar a WhatsApp”*, o pegar aquí un nuevo listado con los productos que querés."
-          );
-        } else if (textIn) {
-          await waSendText(
-            fromId,
-            "Tocá una de las opciones: *Sí, está correcto* o *Quiero corregir algo*."
-          );
-        }
-        saveSession(fromId, s);
-        return res.sendStatus(200);
-      }
-
-      if (s.stage === "C1_WAIT_NEW_CART") {
-        if (type === "text" && textIn) {
-          const again = parseCartFromText(textIn);
-          if (again && again.items.length) {
-            s.items = again.items;
-            s.subtotalPreliminar = again.subtotal;
-            s.rawCartText = textIn;
-            s.stage = "C1";
-            await waSendText(
-              fromId,
-              `Esta es tu selección actualizada:\n${renderProductosDetalle(
-                s.items
-              )}\n\n¿Está correcto tu listado?`
-            );
-            await waSendList(fromId, "Confirmá tu listado:", [
-              { id: "cart_ok", title: "Sí, está correcto" },
-              { id: "cart_fix", title: "Quiero corregir algo" }
-            ]);
-          } else {
-            await waSendText(
-              fromId,
-              "No pude leer productos en ese mensaje. Asegurate de pegar el listado con viñetas (• / *) y cantidades."
-            );
-          }
-        }
-        saveSession(fromId, s);
-        return res.sendStatus(200);
-      }
-
-      // C2: confirmar ubicación
-      if (s.stage === "C2") {
-        if (nx === "loc_ok") {
-          s.stage = "C3";
-        } else if (nx === "loc_change") {
-          s.stage = "C2_CHANGE_CITY";
-          await waSendText(
-            fromId,
-            "Listo, actualicemos tu ubicación.\n\n¿Desde qué *ciudad / departamento* de Bolivia nos escribís?"
-          );
-          saveSession(fromId, s);
-          return res.sendStatus(200);
-        } else if (textIn) {
-          await waSendText(
-            fromId,
-            "Elegí una opción: *Sí, es correcto* o *No, cambiar ubicación*."
-          );
-          saveSession(fromId, s);
-          return res.sendStatus(200);
-        }
-      }
-
-      if (s.stage === "C2_CHANGE_CITY") {
-        if (!textIn || isGreeting(textIn)) {
-          await waSendText(
-            fromId,
-            "Decime desde qué *ciudad / departamento* nos escribís."
-          );
-          saveSession(fromId, s);
-          return res.sendStatus(200);
-        } else {
-          s.ciudad = textIn.trim();
-          s.stage = "C2_CHANGE_ZONE";
-          await waSendText(
-            fromId,
-            `¿En qué *zona o barrio* de ${s.ciudad} estás?`
-          );
-        }
-        saveSession(fromId, s);
-        return res.sendStatus(200);
-      }
-
-      if (s.stage === "C2_CHANGE_ZONE") {
-        if (!textIn || isGreeting(textIn)) {
-          await waSendText(
-            fromId,
-            `Decime en qué *zona o barrio* de ${s.ciudad} estás.`
-          );
-          saveSession(fromId, s);
-          return res.sendStatus(200);
-        } else {
-          s.zona = textIn.trim();
-          s.stage = "C3";
-        }
-        saveSession(fromId, s);
-        if (s.stage !== "C3") return res.sendStatus(200);
-      }
-
-      // C3: tipo de servicio
-      if (s.stage === "C3") {
-        await waSendList(
-          fromId,
-          "¿Cómo querés que armemos la propuesta?",
-          [
-            { id: "srv_retiro", title: "Solo muebles (retirás en tienda)" },
-            { id: "srv_entrega", title: "Muebles + entrega" },
-            {
-              id: "srv_entrega_armado",
-              title: "Muebles + entrega + armado"
-            }
-          ]
-        );
-        s.stage = "C3_WAIT";
-        saveSession(fromId, s);
-        return res.sendStatus(200);
-      }
-
-      if (s.stage === "C3_WAIT") {
-        if (nx === "srv_retiro") {
-          s.tipoServicio = "Solo muebles (retirás en tienda)";
-        } else if (nx === "srv_entrega") {
-          s.tipoServicio = "Muebles + entrega";
-        } else if (nx === "srv_entrega_armado") {
-          s.tipoServicio = "Muebles + entrega + armado";
-        } else if (textIn) {
-          await waSendText(
-            fromId,
-            "Elegí una de las opciones de la lista para el tipo de servicio."
-          );
-          saveSession(fromId, s);
-          return res.sendStatus(200);
-        } else {
-          saveSession(fromId, s);
-          return res.sendStatus(200);
-        }
-
-        // pasar a C4
-        s.stage = "C4";
-        const total =
-          s.subtotalPreliminar ||
-          s.items.reduce(
-            (acc, it) => acc + ((it.price || 0) * (it.qty || 1)),
-            0
-          );
-        s.totalCalculado = total;
-
-        const detalle = renderProductosDetalle(s.items);
-        const nombre = s.nombre || "Cliente";
-
-        const texto = [
-          `Perfecto, ${nombre}.`,
-          "Con la información que nos diste, esta es tu *cotización preliminar*:",
-          "",
-          "COTIZACIÓN MOBICORP",
-          `Cliente: ${nombre} – ${s.tipoCliente || "-"}`,
-          `Ciudad / zona: ${s.ciudad || "-"} – ${s.zona || "-"}`,
-          `Espacio: ${s.tipoEspacio || "-"}`,
-          "",
-          "Productos:",
-          detalle,
-          "",
-          `Servicio: ${s.tipoServicio || "-"}`,
-          "",
-          `TOTAL APROXIMADO: ${humanTotal(total)}`,
-          "(Referencial, sujeto a stock y verificación.)",
-          "",
-          "¿Generamos la *cotización formal en PDF* con estos datos?"
-        ].join("\n");
-
-        await waSendText(fromId, texto);
-        await waSendList(fromId, "Elegí una opción:", [
-          { id: "pdf_yes", title: "Sí, generar PDF" },
-          { id: "pdf_adjust", title: "Ajustar antes" }
-        ]);
-
-        saveSession(fromId, s);
-        return res.sendStatus(200);
-      }
-
-      // C4: decidir si generar PDF
-      if (s.stage === "C4") {
-        if (nx === "pdf_yes") {
-          s.stage = "C5";
-        } else if (nx === "pdf_adjust") {
-          s.stage = "C1_WAIT_NEW_CART";
-          await waSendText(
-            fromId,
-            "Genial, ajustemos antes de generar el PDF.\nPodés reenviar tu selección corregida desde la web o pegar aquí un nuevo listado con productos y cantidades."
-          );
-          saveSession(fromId, s);
-          return res.sendStatus(200);
-        } else if (textIn) {
-          await waSendText(
-            fromId,
-            "Elegí una opción: *Sí, generar PDF* o *Ajustar antes*."
-          );
-          saveSession(fromId, s);
-          return res.sendStatus(200);
-        }
-      }
-
-      // C5: generar PDF + alternativas / ejecutivo
-      if (s.stage === "C5") {
-        try {
-          const { path: pdfPath, filename } = await buildQuote(s, fromId);
-          const mediaIdOut = await waUploadMediaFromFile(
-            pdfPath,
-            "application/pdf",
-            filename
-          );
-          if (mediaIdOut) {
-            await waSendDocument(
-              fromId,
-              mediaIdOut,
-              filename,
-              "🧾 Tu cotización formal de Mobicorp está lista."
-            );
-          }
-          await waSendText(
-            fromId,
-            `Listo 🙌\nTe enviamos la *cotización formal de Mobicorp en PDF*.\n\nCOT MOBICORP – ${s.nombre || "cliente"} enviada.`
-          );
-          await waSendList(fromId, "¿Cómo seguimos?", [
-            { id: "alt_ver", title: "Ver alternativas" },
-            { id: "alt_ejecutivo", title: "Hablar con un ejecutivo" }
-          ]);
-          s.stage = "C5_AFTER";
-        } catch (e) {
-          console.error("[PDF] error", e);
-          await waSendText(
-            fromId,
-            "No pude generar el PDF ahora mismo. ¿Te parece si lo intento nuevamente o preferís que te contacte un ejecutivo?"
-          );
-        }
-        saveSession(fromId, s);
-        return res.sendStatus(200);
-      }
-
-      if (s.stage === "C5_AFTER") {
-        if (nx === "alt_ver") {
-          s.flow = "ia";
-          s.stage = "IA_ALTERNATIVAS";
-          await waSendText(
-            fromId,
-            "Contame qué parte querés optimizar (por ejemplo: sillas, escritorios, presupuesto máximo, estilo) y nuestra IA te sugiere *alternativas más económicas o más premium*."
-          );
-        } else if (nx === "alt_ejecutivo") {
-          await waSendText(
-            fromId,
-            "Te conecto con alguien de nuestro equipo para que terminen la propuesta juntos 🙌"
-          );
-          try {
-            await sendContactCard(fromId);
-          } catch (e) {
-            console.error("[CONTACT] error", e);
-          }
-        } else if (textIn) {
-          await waSendText(
-            fromId,
-            "Elegí *Ver alternativas* o *Hablar con un ejecutivo* desde la lista."
-          );
-        }
         saveSession(fromId, s);
         return res.sendStatus(200);
       }
