@@ -166,19 +166,6 @@ async function sendB3(to) {
   ]);
 }
 
-async function sendSCZoneMenu(to) {
-  await waSendList(
-    to,
-    "¿En qué *zona de Santa Cruz* estás?",
-    [
-      { id: "scz_norte", title: "Zona Norte" },
-      { id: "scz_sur", title: "Zona Sur" },
-      { id: "scz_este", title: "Zona Este" },
-      { id: "scz_oeste", title: "Zona Oeste" }
-    ]
-  );
-}
-
 async function sendB5(to) {
   await waSendList(
     to,
@@ -309,6 +296,7 @@ router.post("/webhook", async (req, res) => {
 
     const fromId = msg.from;
     let s = loadSession(fromId) || {};
+    const prevNombre = s.nombre;
     s.flow = s.flow || "inicio";
     s.stage = s.stage || null;
     s.items = s.items || [];
@@ -332,9 +320,16 @@ router.post("/webhook", async (req, res) => {
     const nx = normalize(textIn);
 
     if (nx === "reiniciar" || nx === "reset" || nx === "inicio") {
-      s = { flow: "inicio", stage: "MENU_INICIO", items: [], history: [], flags: {} };
+      s = {
+        flow: "inicio",
+        stage: "MENU_INICIO",
+        items: [],
+        history: [],
+        flags: {},
+        nombre: prevNombre || s.nombre || null
+      };
       await waSendText(fromId, "🔄 Reinicié la conversación para una nueva atención.");
-      await sendMainMenu(fromId, null);
+      await sendMainMenu(fromId, s.nombre || null);
       saveSession(fromId, s);
       return res.sendStatus(200);
     }
@@ -349,7 +344,7 @@ router.post("/webhook", async (req, res) => {
           const out = await chatIA(
             text,
             s.history,
-            "Respuesta profesional y cercana para un cliente de Mobicorp que consulta por voz sobre mobiliario o proyectos."
+            "Eres el asistente virtual de Mobicorp. Responde en español con un tono profesional, claro y cercano a clientes que consultan por voz sobre mobiliario, proyectos de equipamiento y servicios relacionados. Si la consulta no tiene que ver con muebles u oficinas, responde brevemente y vuelve a invitar a escribir 'reiniciar' o elegir una opción del menú para cotizar o hacer consultas sobre productos."
           );
           s.history.push({ role: "assistant", content: out });
           await waSendText(
@@ -411,17 +406,28 @@ router.post("/webhook", async (req, res) => {
 
       if (!hasFullDatos && !s.stage) {
         s.flow = "inicio";
-        s.stage = "B1";
-        await waSendText(
-          fromId,
-          `👋 Hola, recibí tu selección desde el *catálogo web de Mobicorp*.\n\nEsto es lo que seleccionaste:\n${renderProductosDetalle(
-            s.items
-          )}\n\nPara preparar tu cotización formal necesito algunos datos rápidos.`
-        );
-        await waSendText(
-          fromId,
-          "Para comenzar, ¿cuál es tu *nombre completo* (nombre y apellido)?"
-        );
+        if (s.nombre) {
+          s.stage = "B2";
+          await waSendText(
+            fromId,
+            `👋 Hola ${s.nombre}, recibí tu selección desde el *catálogo web de Mobicorp*.\n\nEsto es lo que seleccionaste:\n${renderProductosDetalle(
+              s.items
+            )}\n\nSolo necesito algunos datos rápidos para preparar tu cotización formal.`
+          );
+          await sendB2(fromId, s.nombre, { first: true });
+        } else {
+          s.stage = "B1";
+          await waSendText(
+            fromId,
+            `👋 Hola, recibí tu selección desde el *catálogo web de Mobicorp*.\n\nEsto es lo que seleccionaste:\n${renderProductosDetalle(
+              s.items
+            )}\n\nPara preparar tu cotización formal necesito algunos datos rápidos.`
+          );
+          await waSendText(
+            fromId,
+            "Para comenzar, ¿cuál es tu *nombre completo* (nombre y apellido)?"
+          );
+        }
         saveSession(fromId, s);
         return res.sendStatus(200);
       }
@@ -460,8 +466,17 @@ router.post("/webhook", async (req, res) => {
           return res.sendStatus(200);
         }
         if (nx === "menu_cotizar") {
-          s.stage = "B1";
-          await sendB1(fromId);
+          if (s.nombre) {
+            s.stage = "B2";
+            await waSendText(
+              fromId,
+              `Perfecto, ${s.nombre}. Armemos tu cotización personalizada.`
+            );
+            await sendB2(fromId, s.nombre, { first: true });
+          } else {
+            s.stage = "B1";
+            await sendB1(fromId);
+          }
           saveSession(fromId, s);
           return res.sendStatus(200);
         }
@@ -580,8 +595,11 @@ router.post("/webhook", async (req, res) => {
         if (nx === "dpto_sc" || textIn.toLowerCase().includes("santa cruz")) {
           s.departamento = "Santa Cruz";
           s.ciudad = "Santa Cruz de la Sierra";
-          s.stage = "B3_SCZ";
-          await sendSCZoneMenu(fromId);
+          s.stage = "B4";
+          await waSendText(
+            fromId,
+            "¿En qué *zona o barrio* de Santa Cruz de la Sierra estás? Ej: Equipetrol, Centro, Norte, etc."
+          );
           saveSession(fromId, s);
           return res.sendStatus(200);
         }
@@ -654,46 +672,6 @@ router.post("/webhook", async (req, res) => {
         return res.sendStatus(200);
       }
 
-      if (s.stage === "B3_SCZ") {
-        if (
-          nx === "scz_norte" ||
-          textIn.toLowerCase().includes("norte")
-        ) {
-          s.zonaMacro = "Norte";
-        } else if (
-          nx === "scz_sur" ||
-          textIn.toLowerCase().includes("sur")
-        ) {
-          s.zonaMacro = "Sur";
-        } else if (
-          nx === "scz_este" ||
-          textIn.toLowerCase().includes("este")
-        ) {
-          s.zonaMacro = "Este";
-        } else if (
-          nx === "scz_oeste" ||
-          textIn.toLowerCase().includes("oeste")
-        ) {
-          s.zonaMacro = "Oeste";
-        } else {
-          await waSendText(
-            fromId,
-            "Elegí una de las zonas: Norte, Sur, Este u Oeste."
-          );
-          await sendSCZoneMenu(fromId);
-          saveSession(fromId, s);
-          return res.sendStatus(200);
-        }
-
-        s.stage = "B4";
-        await waSendText(
-          fromId,
-          `Perfecto. ¿En qué *barrio o zona específica* de Santa Cruz (${s.zonaMacro}) estás?`
-        );
-        saveSession(fromId, s);
-        return res.sendStatus(200);
-      }
-
       if (s.stage === "B4") {
         if (!textIn || isGreeting(textIn)) {
           const ciudadLabel = s.ciudad || s.departamento || "tu ciudad";
@@ -705,13 +683,7 @@ router.post("/webhook", async (req, res) => {
           return res.sendStatus(200);
         }
 
-        const barrio = textIn.trim();
-        if (s.zonaMacro) {
-          s.zona = `${s.zonaMacro} - ${barrio}`;
-        } else {
-          s.zona = barrio;
-        }
-
+        s.zona = textIn.trim();
         s.stage = "B5";
         await sendB5(fromId);
         saveSession(fromId, s);
@@ -839,12 +811,21 @@ router.post("/webhook", async (req, res) => {
 
         if (nx === "ia_cotizar") {
           s.flow = "inicio";
-          s.stage = "B1";
-          await waSendText(
-            fromId,
-            "Genial, avancemos con una cotización personalizada para tu proyecto."
-          );
-          await sendB1(fromId);
+          if (s.nombre) {
+            s.stage = "B2";
+            await waSendText(
+              fromId,
+              "Genial, avancemos con una cotización personalizada para tu proyecto."
+            );
+            await sendB2(fromId, s.nombre, { first: true });
+          } else {
+            s.stage = "B1";
+            await waSendText(
+              fromId,
+              "Genial, avancemos con una cotización personalizada para tu proyecto."
+            );
+            await sendB1(fromId);
+          }
           saveSession(fromId, s);
           return res.sendStatus(200);
         }
@@ -853,7 +834,7 @@ router.post("/webhook", async (req, res) => {
         const out = await chatIA(
           textIn,
           s.history,
-          "Asesoría especializada de Mobicorp sobre mobiliario y proyectos de equipamiento de espacios. Brindar respuestas claras, profesionales y cercanas, sin comprometer precios exactos ni condiciones comerciales que no estén en el contexto."
+          "Eres el asistente virtual de Mobicorp. Responde en español con un tono profesional, claro y cercano. Brinda asesoría sobre mobiliario, ergonomía, tipos de puestos de trabajo, estilos y configuraciones de oficinas y espacios, sin inventar precios ni condiciones comerciales específicas. Si la consulta se aleja del mundo de muebles/proyectos, responde brevemente y redirige al usuario invitándolo a solicitar una cotización o volver al menú principal."
         );
         s.history.push({ role: "assistant", content: out });
 
@@ -890,7 +871,7 @@ router.post("/webhook", async (req, res) => {
           const out = await chatIA(
             textIn,
             s.history,
-            `El usuario ya tiene una cotización de Mobicorp con los siguientes datos:\n${context}\nProponer alternativas de configuración y combinaciones de productos, sin inventar precios exactos, manteniendo un tono profesional y cercano.`
+            `Eres el asistente virtual de Mobicorp. El usuario ya tiene una cotización con los siguientes datos:\n${context}\nProponé alternativas de configuración y combinaciones de productos (más económico, más premium, cambios de cantidades, etc.), sin inventar precios exactos. Mantén un tono profesional y cercano e invita a que el usuario confirme qué alternativa le interesa para ajustar la cotización.`
           );
           s.history.push({ role: "assistant", content: out });
 
@@ -903,6 +884,29 @@ router.post("/webhook", async (req, res) => {
         saveSession(fromId, s);
         return res.sendStatus(200);
       }
+    }
+
+    if (textIn) {
+      try {
+        s.history = s.history || [];
+        s.history.push({ role: "user", content: textIn });
+        const out = await chatIA(
+          textIn,
+          s.history,
+          "Eres el asistente virtual de Mobicorp. Responde siempre en español, con un tono profesional, amable y claro. Primero intenta responder de forma útil cualquier duda general del usuario. Luego, si es relevante, recuérdale que puedes ayudarle a:\n1) Consultar sobre productos y soluciones de mobiliario.\n2) Preparar una cotización formal para su proyecto.\nInvita a escribir 'reiniciar' para volver al menú o a pedir explícitamente una cotización. No inventes precios ni promesas comerciales específicas."
+        );
+        s.history.push({ role: "assistant", content: out });
+        await waSendText(fromId, out);
+        await sendMainMenu(fromId, s.nombre || null);
+      } catch (e) {
+        console.error("[IA fallback] error:", e);
+        await waSendText(
+          fromId,
+          "Soy el asistente virtual de Mobicorp. Puedo ayudarte a resolver dudas sobre productos o a preparar una cotización para tu proyecto. Escribí *reiniciar* para volver al menú principal."
+        );
+      }
+      saveSession(fromId, s);
+      return res.sendStatus(200);
     }
 
     await waSendText(
