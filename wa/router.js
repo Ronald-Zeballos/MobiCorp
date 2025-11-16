@@ -205,18 +205,86 @@ function renderProductosDetalle(items = []) {
     .join("\n");
 }
 
-async function startCatalogConfirmation(fromId, s) {
-  const nombre = s.nombre || "allí";
-  await waSendText(
-    fromId,
-    `👋 ${s.nombre ? `Hola ${s.nombre}` : "Hola"}.\nRecibí tu selección desde el *catálogo web de Mobicorp*.\n\nEsto es lo que seleccionaste:\n${renderProductosDetalle(
-      s.items
-    )}\n\n¿Está correcto tu listado?`
-  );
-  await waSendList(fromId, "Confirmá tu listado:", [
-    { id: "cart_ok", title: "Sí, está correcto" },
-    { id: "cart_fix", title: "Quiero ajustar mi listado" }
-  ]);
+async function generateAndSendQuote(fromId, s) {
+  try {
+    s = await djangoFillCartPrices(s, fromId);
+  } catch (e) {
+    console.error("[DJANGO] Error al completar precios:", e.message);
+  }
+
+  const total =
+    s.subtotalPreliminar ||
+    s.items.reduce(
+      (acc, it) => acc + ((it.price || 0) * (it.qty || 1)),
+      0
+    );
+  s.totalCalculado = total;
+
+  const detalle = renderProductosDetalle(s.items);
+  const nombre = s.nombre || "Cliente";
+
+  const texto = [
+    `Perfecto, ${nombre}.`,
+    "Con la información que compartiste, esta es tu *cotización preliminar*:",
+    "",
+    "COTIZACIÓN MOBICORP",
+    `Cliente: ${nombre} – ${s.tipoCliente || "-"}`,
+    `Ciudad / zona: ${s.ciudad || "-"} – ${s.zona || "-"}`,
+    `Tipo de espacio: ${s.tipoEspacio || "-"}`,
+    "",
+    "Productos seleccionados:",
+    detalle,
+    "",
+    `Servicio: ${s.tipoServicio || "A definir junto al asesor"}`,
+    "",
+    `TOTAL APROXIMADO: ${humanTotal(total)}`,
+    "(Monto referencial, sujeto a stock y verificación final).",
+    "",
+    "A continuación te envío la *cotización formal en PDF*."
+  ].join("\n");
+
+  await waSendText(fromId, texto);
+
+  let pdfFilename = null;
+  try {
+    const { path: pdfPath, filename } = await buildQuote(s, fromId);
+    pdfFilename = filename;
+    const mediaIdOut = await waUploadMediaFromFile(
+      pdfPath,
+      "application/pdf",
+      filename
+    );
+    if (mediaIdOut) {
+      await waSendDocument(
+        fromId,
+        mediaIdOut,
+        filename,
+        "🧾 Tu cotización formal de Mobicorp está lista."
+      );
+    }
+    await waSendText(
+      fromId,
+      "Listo 🙌\nTe enviamos la *cotización formal de Mobicorp en PDF*.\nSi luego querés ver alternativas o hacer ajustes, escribime por aquí y te ayudo."
+    );
+  } catch (e) {
+    console.error("[PDF] error", e);
+    await waSendText(
+      fromId,
+      "No pude generar el PDF en este momento. Podés intentar más tarde o pedir que te contacte un ejecutivo de ventas."
+    );
+  }
+
+  try {
+    await djangoSendOrder(s, fromId, {
+      pdfFilename: pdfFilename || null
+    });
+  } catch (e) {
+    console.error("[DJANGO] Error al enviar orden final:", e.message);
+  }
+
+  s.flow = "ia";
+  s.stage = "IA_ALTERNATIVAS";
+  return s;
 }
 
 const router = express.Router();
@@ -338,10 +406,10 @@ router.post("/webhook", async (req, res) => {
       s.subtotalPreliminar = parsedCart.subtotal;
       s.rawCartText = textIn;
 
-      const hasDatosPrevios =
-        s.nombre || s.tipoCliente || s.departamento || s.zona || s.tipoEspacio;
+      const hasFullDatos =
+        s.nombre && s.tipoCliente && s.departamento && s.zona && s.tipoEspacio;
 
-      if (!hasDatosPrevios && !s.stage) {
+      if (!hasFullDatos && !s.stage) {
         s.flow = "inicio";
         s.stage = "B1";
         await waSendText(
@@ -356,13 +424,20 @@ router.post("/webhook", async (req, res) => {
         );
         saveSession(fromId, s);
         return res.sendStatus(200);
-      } else {
-        s.flow = "catalog";
-        s.stage = "C1";
-        await startCatalogConfirmation(fromId, s);
+      }
+
+      if (hasFullDatos) {
+        s = await generateAndSendQuote(fromId, s);
         saveSession(fromId, s);
         return res.sendStatus(200);
       }
+
+      await waSendText(
+        fromId,
+        "Perfecto, ya tengo tu selección de productos. Terminemos unos datos más y enseguida te envío la cotización."
+      );
+      saveSession(fromId, s);
+      return res.sendStatus(200);
     }
 
     if (s.flow === "inicio") {
@@ -686,9 +761,7 @@ router.post("/webhook", async (req, res) => {
         }
 
         if (s.items && s.items.length) {
-          s.flow = "catalog";
-          s.stage = "C1";
-          await startCatalogConfirmation(fromId, s);
+          s = await generateAndSendQuote(fromId, s);
           saveSession(fromId, s);
           return res.sendStatus(200);
         }
@@ -717,9 +790,7 @@ router.post("/webhook", async (req, res) => {
         s.tipoEspacio = textIn.trim();
 
         if (s.items && s.items.length) {
-          s.flow = "catalog";
-          s.stage = "C1";
-          await startCatalogConfirmation(fromId, s);
+          s = await generateAndSendQuote(fromId, s);
           saveSession(fromId, s);
           return res.sendStatus(200);
         }
@@ -728,7 +799,7 @@ router.post("/webhook", async (req, res) => {
         const url = getCatalogUrl(s.tipoEspacio);
         const msgCatalogo =
           url && url.startsWith("http")
-            ? `Perfecto, ${s.nombre}.\nTe comparto nuestro *catálogo web* para *${s.tipoEspacio}*:\n${url}\n\nAhí podés ver modelos, precios y elegir cantidades.\nCuando termines tu selección, en la web tocá el botón *“Enviar a WhatsApp / Solicitar cotización”* y seguimos por acá con tu cotización automática.`
+            ? `Perfecto, ${s.nombre}.\nTe comparto nuestro *catálogo web* para *${s.tipoEspacio}*:\n${url}\n\nAhí podés ver modelos, precios y elegir cantidades.\nCuando termines tu selección, tocá el botón *“Enviar a WhatsApp / Solicitar cotización”* y seguimos por acá con tu cotización automática.`
             : `Perfecto, ${s.nombre}.\n\nTe comparto nuestro catálogo web para *${s.tipoEspacio}*. Cuando termines tu selección, tocá el botón *“Enviar a WhatsApp / Solicitar cotización”* y seguimos por acá con tu cotización automática.`;
         await waSendText(fromId, msgCatalogo);
         s.stage = "B6_WAIT_WEB";
@@ -741,173 +812,6 @@ router.post("/webhook", async (req, res) => {
           fromId,
           "Cuando finalices tu selección en el catálogo, tocá *“Enviar a WhatsApp / Solicitar cotización”* y voy a leer tu pedido automáticamente para armar la propuesta."
         );
-        saveSession(fromId, s);
-        return res.sendStatus(200);
-      }
-    }
-
-    if (s.flow === "catalog") {
-      if (s.stage === "C1") {
-        if (nx === "cart_ok") {
-          await waSendList(
-            fromId,
-            "¿Cómo preferís el servicio para esta propuesta?",
-            [
-              { id: "srv_retiro", title: "Solo muebles (retirás en tienda)" },
-              { id: "srv_entrega", title: "Muebles + entrega" },
-              {
-                id: "srv_entrega_armado",
-                title: "Muebles + entrega + armado"
-              }
-            ]
-          );
-          s.stage = "C3_WAIT";
-          saveSession(fromId, s);
-          return res.sendStatus(200);
-        } else if (nx === "cart_fix") {
-          s.stage = "C1_WAIT_NEW_CART";
-          await waSendText(
-            fromId,
-            "Perfecto. Podés ajustar tu selección en el catálogo y volver a enviar, o pegar aquí un nuevo listado con los productos y cantidades que querés."
-          );
-          saveSession(fromId, s);
-          return res.sendStatus(200);
-        } else if (textIn) {
-          await waSendText(
-            fromId,
-            "Por favor elegí una de las opciones: *Sí, está correcto* o *Quiero ajustar mi listado*."
-          );
-          saveSession(fromId, s);
-          return res.sendStatus(200);
-        }
-      }
-
-      if (s.stage === "C1_WAIT_NEW_CART") {
-        if (type === "text" && textIn) {
-          const again = parseCartFromText(textIn);
-          if (again && again.items.length) {
-            s.items = again.items;
-            s.subtotalPreliminar = again.subtotal;
-            s.rawCartText = textIn;
-            s.stage = "C1";
-            await waSendText(
-              fromId,
-              `Esta es tu selección actualizada:\n${renderProductosDetalle(
-                s.items
-              )}\n\n¿Está correcto tu listado?`
-            );
-            await waSendList(fromId, "Confirmá tu listado:", [
-              { id: "cart_ok", title: "Sí, está correcto" },
-              { id: "cart_fix", title: "Quiero ajustar mi listado" }
-            ]);
-          } else {
-            await waSendText(
-              fromId,
-              "No pude leer productos en ese mensaje. Asegurate de pegar el listado con viñetas y cantidades."
-            );
-          }
-        }
-        saveSession(fromId, s);
-        return res.sendStatus(200);
-      }
-
-      if (s.stage === "C3_WAIT") {
-        if (nx === "srv_retiro") {
-          s.tipoServicio = "Solo muebles (retirás en tienda)";
-        } else if (nx === "srv_entrega") {
-          s.tipoServicio = "Muebles + entrega";
-        } else if (nx === "srv_entrega_armado") {
-          s.tipoServicio = "Muebles + entrega + armado";
-        } else if (textIn) {
-          await waSendText(
-            fromId,
-            "Elegí una de las opciones para el tipo de servicio que preferís."
-          );
-          saveSession(fromId, s);
-          return res.sendStatus(200);
-        } else {
-          saveSession(fromId, s);
-          return res.sendStatus(200);
-        }
-
-        try {
-          s = await djangoFillCartPrices(s, fromId);
-        } catch (e) {
-          console.error("[DJANGO] Error al completar precios:", e.message);
-        }
-
-        const total =
-          s.subtotalPreliminar ||
-          s.items.reduce(
-            (acc, it) => acc + ((it.price || 0) * (it.qty || 1)),
-            0
-          );
-        s.totalCalculado = total;
-
-        const detalle = renderProductosDetalle(s.items);
-        const nombre = s.nombre || "Cliente";
-
-        const texto = [
-          `Perfecto, ${nombre}.`,
-          "Con la información que compartiste, esta es tu *cotización preliminar*:",
-          "",
-          "COTIZACIÓN MOBICORP",
-          `Cliente: ${nombre} – ${s.tipoCliente || "-"}`,
-          `Ciudad / zona: ${s.ciudad || "-"} – ${s.zona || "-"}`,
-          `Tipo de espacio: ${s.tipoEspacio || "-"}`,
-          "",
-          "Productos seleccionados:",
-          detalle,
-          "",
-          `Servicio solicitado: ${s.tipoServicio || "-"}`,
-          "",
-          `TOTAL APROXIMADO: ${humanTotal(total)}`,
-          "(Monto referencial, sujeto a stock y verificación final).",
-          "",
-          "A continuación te envío la *cotización formal en PDF*."
-        ].join("\n");
-
-        await waSendText(fromId, texto);
-
-        let pdfFilename = null;
-        try {
-          const { path: pdfPath, filename } = await buildQuote(s, fromId);
-          pdfFilename = filename;
-          const mediaIdOut = await waUploadMediaFromFile(
-            pdfPath,
-            "application/pdf",
-            filename
-          );
-          if (mediaIdOut) {
-            await waSendDocument(
-              fromId,
-              mediaIdOut,
-              filename,
-              "🧾 Tu cotización formal de Mobicorp está lista."
-            );
-          }
-          await waSendText(
-            fromId,
-            "Listo 🙌\nTe enviamos la *cotización formal de Mobicorp en PDF*.\nSi luego querés ver alternativas o hacer ajustes, escribime por aquí y te ayudo."
-          );
-        } catch (e) {
-          console.error("[PDF] error", e);
-          await waSendText(
-            fromId,
-            "No pude generar el PDF en este momento. Podés intentar más tarde o pedir que te contacte un ejecutivo de ventas."
-          );
-        }
-
-        try {
-          await djangoSendOrder(s, fromId, {
-            pdfFilename: pdfFilename || null
-          });
-        } catch (e) {
-          console.error("[DJANGO] Error al enviar orden final:", e.message);
-        }
-
-        s.flow = "ia";
-        s.stage = "IA_ALTERNATIVAS";
         saveSession(fromId, s);
         return res.sendStatus(200);
       }
