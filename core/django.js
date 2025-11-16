@@ -35,17 +35,14 @@ export async function djangoSendOrder(session, waId, extras = {}) {
   const clientePayload = {
     idCliente: idCliente,
     nombreCompleto: session.nombre || "",
-    email: session.email || null,
-    telefono: session.telefono || waId || null,
+    email: session.email || "",
+    telefono: session.telefono || waId || "",
     zona: session.zona || "",
-    ciudad: session.ciudad || "",
+    ciudad: session.ciudad || session.departamento || "",
     pais: "Bolivia",
     canalOrigen: "whatsapp",
     fechaRegistro: nowIso,
-    imageUrl: session.imageUrl || null,
-    whatsappId: waId || null,
-    tipoCliente: session.tipoCliente || null,
-    tipoEspacio: session.tipoEspacio || null
+    imageUrl: session.imageUrl || null
   };
 
   const headers = {
@@ -77,13 +74,24 @@ export async function djangoSendOrder(session, waId, extras = {}) {
   const montoTotal =
     session.totalCalculado ||
     session.subtotalPreliminar ||
-    session.items?.reduce(
+    (session.items || []).reduce(
       (acc, it) => acc + ((it.price || 0) * (it.qty || 1)),
       0
     ) ||
     0;
 
   const idPedido = Number(String(Date.now()).slice(-9));
+
+  const observacionesText = [
+    `WA: ${waId || "-"}`,
+    `TipoCliente: ${session.tipoCliente || "-"}`,
+    `TipoEspacio: ${session.tipoEspacio || "-"}`,
+    `Zona: ${session.zona || "-"}`,
+    extras.pdfFilename ? `PDF: ${extras.pdfFilename}` : null,
+    extras.quoteId ? `QuoteId: ${extras.quoteId}` : null
+  ]
+    .filter(Boolean)
+    .join(" | ");
 
   const pedidoPayload = {
     idPedido: idPedido,
@@ -95,18 +103,7 @@ export async function djangoSendOrder(session, waId, extras = {}) {
     fechaCreacion: nowIso,
     fechaConfirmacion: null,
     urlPdfCotizacion: extras.pdfUrl || null,
-    observaciones: `WA: ${waId || "-"} | TipoEspacio: ${session.tipoEspacio || "-"} | Servicio: ${session.tipoServicio || "-"}`,
-    items: (session.items || []).map((it, idx) => ({
-      line: idx + 1,
-      idProducto: it.idProducto || null,
-      skuInterno: it.sku || it.sku_interno || null,
-      nombre: it.name || it.nombre || "",
-      cantidad: it.qty || 1,
-      precioUnitario: it.price || 0,
-      subtotal: it.subtotal || ((it.price || 0) * (it.qty || 1))
-    })),
-    pdfFilename: extras.pdfFilename || null,
-    quoteId: extras.quoteId || null
+    observaciones: observacionesText || "Pedido generado desde bot de WhatsApp"
   };
 
   try {
