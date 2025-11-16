@@ -1,5 +1,5 @@
 // src/aichat.js
-// OpenAI Chat + Whisper + TTS (audio de respuesta) — versión robusta
+// OpenAI Chat + Whisper + TTS (audio de respuesta) — versión para Mobicorp (mobiliario)
 
 import fs from "fs";
 import path from "path";
@@ -8,6 +8,7 @@ import OpenAI from "openai";
 import { config } from "../env.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
 const client = new OpenAI({
   apiKey: config.OPENAI_API_KEY || process.env.OPENAI_API_KEY
 });
@@ -25,123 +26,78 @@ const BASE_DELAY_MS = Number(process.env.AI_BASE_DELAY_MS || 800);
 const FORCE_ES      = (process.env.AI_FORCE_SPANISH || "1") === "1";
 
 // ===== Utils =====
-const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const jitter = (ms) => Math.floor(ms * (0.75 + Math.random() * 0.5));
 const cleanStr = (s) => String(s ?? "").replace(/\s+/g, " ").trim();
-const toNumber = (s) =>
-  Number(String(s || "").replace(/[^\d.,]/g, "").replace(",", "."));
 
-// ===== Portafolio (contexto agro) =====
-// IMPORTANTE: precios = 0 -> el asistente NUNCA inventa precios.
-const PORTAFOLIO = [
-  {"sku":"SEAL-20L","nombre":"SEAL","ingrediente_activo":"Atrazine 500 g/l SC","categoria":"Herbicida","cultivo":["Maíz","Sorgo"],"plaga":["Verdolaga","Quinuilla","Malva taporita","Chiori"],"dosis":"3–4 L/ha (maíz) | 3 L/ha (sorgo)","formulacion":"Herbicida selectivo de pre y postemergencia. Acción sistémica y contacto.","presentaciones":["20 L"],"precio_bs":0,"link_ficha":"https://tinyurl.com/PORTAFOLIO-NEWCHEM"},
-  {"sku":"SINERGY-10-20L","nombre":"SINERGY","ingrediente_activo":"Clethodim 240 g/l EC","categoria":"Herbicida","cultivo":["Soya"],"plaga":["Rogelia","Orizahá","Cadillo","Pata de gallina","Pata de gallo"],"dosis":"0.3–0.5 L/ha","formulacion":"Herbicida selectivo post emergente. Rápida absorción y amplio uso sobre el espectro de malezas.","presentaciones":["10 L","20 L"],"precio_bs":0,"link_ficha":"https://tinyurl.com/PORTAFOLIO-NEWCHEM"},
-  {"sku":"DRIER-20-200L","nombre":"DRIER","ingrediente_activo":"Paraquat dichloride 276 g/l SL","categoria":"Herbicida","cultivo":["Barbecho químico"],"plaga":["Chiori"],"dosis":"2 L/ha","formulacion":"Herbicida de contacto y desecante. Rápida acción sobre las malezas.","presentaciones":["20 L","200 L"],"precio_bs":0,"link_ficha":"https://tinyurl.com/PORTAFOLIO-NEWCHEM"},
-  {"sku":"GLISATO-20-200L","nombre":"GLISATO","ingrediente_activo":"Glifosato Sal IPA 480 g/l SL","categoria":"Herbicida","cultivo":["Barbecho químico"],"plaga":["Rogelia","Torito","Verdolaga camba","Emilia","Leche leche","Sanana","Chiori","Malva taporita","Chupurujume","Maicillo"],"dosis":"2.5–3 L/ha","formulacion":"Herbicida no selectivo de acción sistémica y por translocación. Buena performance.","presentaciones":["20 L","200 L"],"precio_bs":0,"link_ficha":"https://tinyurl.com/PORTAFOLIO-NEWCHEM"},
-  {"sku":"NICOXAM-10L","nombre":"NICOXAM","ingrediente_activo":"Thiametoxan 333 g/l SC","categoria":"Insecticida-Acaricida","cultivo":["Soya"],"plaga":["Chinche verde pequeño"],"dosis":"0.2–0.25 L/ha","formulacion":"Insecticida de contacto e ingestión. Excelente control para chinches.","presentaciones":["10 L"],"precio_bs":0,"link_ficha":"https://tinyurl.com/PORTAFOLIO-NEWCHEM"},
-  {"sku":"TRENCH-10L","nombre":"TRENCH","ingrediente_activo":"Bifenthrin 100 g/l EC","categoria":"Insecticida-Acaricida","cultivo":["Soya"],"plaga":["Chinche café panza verde","Mosca barrenadora"],"dosis":"0.3–0.4 L/ha","formulacion":"Insecticida que actúa por contacto e ingestión. Excelente efecto de choque y volteo en plagas.","presentaciones":["10 L"],"precio_bs":0,"link_ficha":"https://tinyurl.com/PORTAFOLIO-NEWCHEM"},
-  {"sku":"MEXIN-5-10L","nombre":"MEXIN","ingrediente_activo":"Abamectin 50 g/l EC","categoria":"Insecticida-Acaricida","cultivo":["Soya"],"plaga":["Ácaro"],"dosis":"0.11–0.14 L/ha","formulacion":"Insecticida-Acaricida de contacto e ingestión. Control eficaz sobre ácaros.","presentaciones":["5 L","10 L"],"precio_bs":0,"link_ficha":"https://tinyurl.com/PORTAFOLIO-NEWCHEM"},
-  {"sku":"FENPRONIL-1KG","nombre":"FENPRONIL","ingrediente_activo":"Fipronil 800 g/kg WG","categoria":"Insecticida-Acaricida","cultivo":["Soya"],"plaga":["Picudo gris pequeño","Trips"],"dosis":"45–60 g/100 kg de semilla o 80 g/ha","formulacion":"Insecticida de contacto e ingestión. Altamente efectivo y contundente sobre un amplio rango de plagas.","presentaciones":["1 Kg"],"precio_bs":0,"link_ficha":"https://tinyurl.com/PORTAFOLIO-NEWCHEM"},
-  {"sku":"NOATO-1KG","nombre":"NOATO","ingrediente_activo":"Emamectin Benzoato 57 g/kg WG","categoria":"Insecticida-Acaricida","cultivo":["Soya"],"plaga":["Pegador de hoja"],"dosis":"0.125–0.2 Kg/ha","formulacion":"Insecticida de contacto e ingestión. Formulación diferenciada, no tranca boquillas.","presentaciones":["1 Kg"],"precio_bs":0,"link_ficha":"https://tinyurl.com/PORTAFOLIO-NEWCHEM"},
-  {"sku":"LAYER-25KG","nombre":"LAYER","ingrediente_activo":"Mancozeb 800 g/kg WP","categoria":"Fungicida","cultivo":["Soya"],"plaga":["Roya Asiática"],"dosis":"2–3 Kg/ha","formulacion":"Fungicida de contacto, preventivo, curativo, erradicante, protector-multisitio. Buen control sobre enfermedades de fin de ciclo.","presentaciones":["25 Kg"],"precio_bs":0,"link_ficha":"https://tinyurl.com/PORTAFOLIO-NEWCHEM"}
-];
-
-// Índices rápidos (por si los usas en otros módulos)
-const ixPorNombre  = new Map(PORTAFOLIO.map(p => [p.nombre.toLowerCase(), p]));
-const ixPorSku     = new Map(PORTAFOLIO.map(p => [p.sku.toLowerCase(), p]));
-const ixPorCultivo = PORTAFOLIO.reduce((m,p)=>{
-  (p.cultivo||[]).forEach(c=>{
-    const k = c.toLowerCase();
-    (m.get(k) || m.set(k, []).get(k)).push(p);
-  });
-  return m;
-}, new Map());
-const ixPorPlaga = PORTAFOLIO.reduce((m,p)=>{
-  (p.plaga||[]).forEach(c=>{
-    const k = c.toLowerCase();
-    (m.get(k) || m.set(k, []).get(k)).push(p);
-  });
-  return m;
-}, new Map());
-
-// Render contexto compacto
-function renderContextoPortafolio() {
-  return PORTAFOLIO.map(p => {
-    const cult = (p.cultivo||[]).join(", ");
-    const plg  = (p.plaga||[]).join(", ");
-    return `• ${p.nombre} (${p.categoria}) — IA: ${p.ingrediente_activo}. Cultivos: ${cult || "-"}; Plagas: ${plg || "-"}; Dosis: ${p.dosis}. Presentaciones: ${p.presentaciones?.join(", ") || "-"}; Ficha: ${p.link_ficha}`;
-  }).join("\n");
-}
-
-// Heurística simple para detectar intención técnica
-function needsPortfolio(userText) {
-  const t = userText.toLowerCase();
-  return [
-    "dosis","l/ha","kg/ha","cultivo","soya","maíz","maiz","sorgo","plaga","chinche","roya","barbecho",
-    "glisato","drier","layer","sinergy","nicoxam","trench","mexin","fenpronil","noato","seal","mancozeb","glifosato","paraquat","clethodim"
-  ].some(k => t.includes(k));
-}
-
-// Extraer hectáreas si el usuario menciona un número con ha
-function extractHectareas(userText) {
-  const m = userText.match(/(\d+(?:[.,]\d+)?)\s*(ha|hect(a|á)reas?)/i);
-  if (!m) return null;
-  const n = toNumber(m[1]);
-  return Number.isFinite(n) && n > 0 ? n : null;
-}
-
-// ===== Prompt builder =====
+// ===== Prompt builder (Mobicorp / mobiliario) =====
 function buildMessages(userText, history = [], extraSystem = "") {
-  const hed = FORCE_ES ? "Responde en español neutro de Bolivia." : "";
+  const hed = FORCE_ES ? "Responde siempre en español neutro (Bolivia o región). " : "";
+
   const role =
-    "Eres *AgroBot*, asistente de NewChem Agroquímicos. Ayudas con cultivos, plagas, productos y cotizaciones referenciales (sin inventar precios).";
-  const voice =
-    "Tono cercano, profesional y ágil; estilo de vendedora experta que va directo al punto.";
+    "Eres *MobiBot*, el asistente virtual de *Mobicorp*, empresa especializada en mobiliario, equipamiento y soluciones para oficinas, empresas, coworks y espacios comerciales. ";
+
+  const scope =
+    "Tu foco son temas de mobiliario: sillas ergonómicas, escritorios, estaciones de trabajo, mesas de reunión, recepción, almacenamiento, call centers, equipamiento de oficinas, salas de espera y espacios corporativos en general. ";
+
+  const tone =
+    "Tu tono es profesional, cordial y cercano, como un asesor comercial que conoce muy bien el portafolio y entiende proyectos de oficinas modernas. Evita tecnicismos innecesarios y explicá de forma clara y concreta. ";
+
+  const pricing =
+    "No inventes precios exactos, descuentos ni condiciones comerciales específicas (plazos, garantías, entregas) si no están en el contexto. Cuando el usuario pregunte por precios concretos, podés orientarlo en rangos generales o recomendar que solicite una cotización formal. ";
+
+  const flows =
+    "Si el usuario menciona palabras como 'cotización', 'presupuesto', 'precio detallado', 'armar propuesta' o 'quiero cotizar', sugerí avanzar por el flujo de cotización que maneja el bot (sin describirlo técnicamente, solo dile que el bot le pedirá algunos datos para armar la propuesta). ";
+
+  const catalog =
+    "Si el usuario menciona 'catálogo', 'catalogo', 'modelos', 'ver opciones', 'ver sillas' o 'ver escritorios', recomendá usar el catálogo web de Mobicorp que el bot puede enviar por enlace, y luego continuar la conversación para afinar la elección. ";
+
+  const location =
+    "Si el usuario pregunta por 'ubicación', 'direccion', 'dónde están', 'donde queda la tienda', recalca que el bot puede enviar la ubicación oficial de Mobicorp y que allí puede ver el punto en el mapa. ";
+
   const safety =
-    "Si falta dato (precio, stock, registro), dilo explícitamente. No inventes precios ni registros. Ofrece cotizar o derivar a un asesor.";
-  const calc =
-    "Si el usuario brinda hectáreas, calcula necesidades totales con la dosis indicada (usa rangos: mínimo y máximo). Ejemplo: 2–3 L/ha × 50 ha → 100–150 L.";
+    "No des consejos médicos, financieros, legales, ni opines de política o temas fuera de contexto. Si el usuario pregunta algo totalmente ajeno a mobiliario o a Mobicorp, responde brevemente que solo puedes ayudar con temas de mobiliario y proyectos de equipamiento de espacios, y sugerí que escriba palabras como 'catálogo' o 'cotización'. ";
+
   const brevity =
-    "Mantén respuestas breves y concretas: máximo 3–5 frases o 6 viñetas cortas. Evita repetir ideas, saludos largos o conclusiones redundantes.";
+    "Mantén las respuestas breves y accionables: máximo 3–5 frases o, si corresponde, 4–6 viñetas cortas. No repitas saludos largos ni cierres redundantes. ";
+
   const format =
-    "Cuando sea útil, usa viñetas; incluye nombre comercial y ingrediente activo en recomendaciones.";
-  const domain =
-    "Contexto: agricultura boliviana; barbecho, soya, maíz, sorgo y plagas frecuentes. Evita recomendaciones fuera de etiqueta.";
-  const noMed =
-    "No des consejos de seguridad más allá de advertir que se siga siempre la etiqueta y la ficha de seguridad del producto.";
+    "Cuando hagas recomendaciones, usa viñetas y menciona el tipo de producto (por ejemplo: 'silla ergonómica con apoyo lumbar', 'estación de trabajo para 4 puestos', 'mesa de reunión para 6–8 personas'). Si es útil, sugiere configuraciones de layout (disposición de puestos, recepción, sala de reunión, etc.). ";
+
   const closing =
-    "Cierra, si corresponde, ofreciendo cotizar o hablar con un asesor humano.";
+    "Cierra, cuando tenga sentido, invitando a seguir con el catálogo o a solicitar una cotización para que el equipo de Mobicorp revise el proyecto. ";
 
   const sysParts = [
     hed,
     role,
-    voice,
+    scope,
+    tone,
+    pricing,
+    flows,
+    catalog,
+    location,
     safety,
-    calc,
     brevity,
     format,
-    domain,
-    noMed,
     closing,
     extraSystem || ""
   ].filter(Boolean);
 
-  const ctx = needsPortfolio(userText)
-    ? `\n\n### Portafolio disponible (resumen)\n${renderContextoPortafolio()}`
-    : "";
+  const sys = sysParts.join(" ");
 
-  const sys = sysParts.join(" ") + ctx;
-
-  const hist = (history || []).slice(-MAX_HISTORY).map(m => ({
-    role: m.role,
-    content: cleanStr(m.content)
-  }));
+  const hist = (history || [])
+    .slice(-MAX_HISTORY)
+    .map((m) => ({
+      role: m.role,
+      content: cleanStr(m.content)
+    }));
 
   const messages = [
     { role: "system", content: sys },
     ...hist,
     { role: "user", content: cleanStr(userText) }
   ];
+
   return messages;
 }
 
@@ -155,7 +111,7 @@ function buildMessages(userText, history = [], extraSystem = "") {
 export async function chatIA(userText, history = [], extraSystem = "") {
   const text = cleanStr(userText);
   if (!text) {
-    return "¿Podés contarme un poco más? Te ayudo con cultivos, plagas, dosis o una cotización referencial.";
+    return "¿Podés contarme un poco más? Te ayudo con dudas sobre mobiliario, proyectos de oficina o una cotización.";
   }
 
   let attempt = 0;
@@ -172,7 +128,7 @@ export async function chatIA(userText, history = [], extraSystem = "") {
       });
       const out = resp?.choices?.[0]?.message?.content?.trim();
       if (out) return out;
-      return "No pude generar una respuesta clara, ¿podés reformular la consulta en pocas palabras?";
+      return "No pude generar una respuesta clara, ¿podés resumir tu consulta en pocas palabras relacionada a mobiliario u oficinas?";
     } catch (err) {
       lastErr = err;
       const status = err?.status || err?.code || 500;
@@ -201,7 +157,7 @@ export async function chatIA(userText, history = [], extraSystem = "") {
   }
 
   console.error("[IA chat] fallback:", lastErr);
-  return "La IA está con tráfico alto. Probá de nuevo en un momento o escribí *asesor* para que te atienda alguien del equipo.";
+  return "La IA está con tráfico alto. Probá de nuevo en un momento o escribí *cotización* o *catálogo* y el bot te guía paso a paso.";
 }
 
 // =============== Transcripción (Whisper) ===============
@@ -237,7 +193,7 @@ export async function transcribeAudio(buffer, filename = "audio.ogg") {
  */
 export async function synthesizeSpeech(
   text,
-  filename = "respuesta_agrobot.mp3"
+  filename = "respuesta_mobicorp.mp3"
 ) {
   const safe = cleanStr(text);
   if (!safe) return null;
@@ -248,7 +204,7 @@ export async function synthesizeSpeech(
 
   const speech = await client.audio.speech.create({
     model: TTS_MODEL,
-    voice: TTS_VOICE,   // voz de mujer (p.ej. "nova")
+    voice: TTS_VOICE,
     format: "mp3",
     input: safe
   });
