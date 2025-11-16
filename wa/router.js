@@ -3,72 +3,43 @@ import express from "express";
 import fetch from "node-fetch";
 import { config } from "../env.js";
 import { loadSession, saveSession } from "../core/session.js";
-import { loadCatalog } from "../core/catalog.js";
 import {
   waSendText,
   waSendList,
   waSendDocument,
-  waUploadMediaFromFile,
-  waSendImage
+  waUploadMediaFromFile
 } from "./send.js";
 import { buildQuote } from "../src/quote.js";
 import { chatIA, transcribeAudio } from "../src/aichat.js";
+import { parseCartFromText } from "../src/parse.js";
 
 // ======== Config WhatsApp ========
 const GRAPH_BASE = "https://graph.facebook.com/v20.0";
-const PHONE_ID   = config.WHATSAPP_PHONE_ID;
-const TOKEN      = config.WHATSAPP_TOKEN;
+const PHONE_ID = config.WHATSAPP_PHONE_ID;
+const TOKEN = config.WHATSAPP_TOKEN;
 
-// ======== Catálogo simple (imágenes locales) ========
-const KNOWN_PRODUCTS = [
-  { key: "drier",   name: "Drier",   img: "Drier.jpg"   },
-  { key: "glisato", name: "Glisato", img: "Glisato.jpg" },
-  { key: "layer",   name: "Layer",   img: "Layer.jpg"   },
-  { key: "trench",  name: "Trench",  img: "Trench.jpg"  },
-  { key: "nicoxam", name: "Nicoxam", img: "Nicoxam.jpg" } // por si luego lo usas
-];
-
-// ========= Helpers =========
+// ===== Utils =====
 function normalize(s = "") {
   return s.normalize("NFD").replace(/\p{Diacritic}+/gu, "").toLowerCase().trim();
 }
 
-// Mini-menú en texto (fallback)
-function humanMenu() {
-  return (
-`📋 *Opciones disponibles*
-
-🛒 *Quiero comprar*       → cotizar
-🧾 *Ver catálogo*         → catalogo
-🔎 *Saber de un producto*  → producto
-📍 *Ubicación*            → ubicacion
-🕒 *Horarios*             → horarios
-👩‍💼 *Hablar con un asesor* → asesor
-🧠 *IA interactiva*       → dudas`
-  );
+function humanTotal(subtotal) {
+  const n = Number(subtotal || 0);
+  const s = n.toFixed(2).replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+  return `Bs ${s}`;
 }
 
-// ===== Botón universal "Volver al menú" (lista de 1 ítem) =====
-async function sendBackList(to, text = "¿Querés hacer otra cosa?") {
-  await waSendList(to, text, [{ id: "go_menu", title: "⬅️ Volver al menú" }]);
-}
-
-// ===== Menú principal =====
-async function sendIntroList(to, { returned = false } = {}) {
-  const headline = returned
-    ? "👋 ¡Bienvenido de nuevo! ¿En qué te ayudo ahora?"
-    : "👋 Soy *AgroBot*, asistente virtual de *NewChem Agroquímicos*.\nEstoy para ayudarte a comprar, resolver dudas y ubicar nuestras sucursales.";
-  await waSendText(to, headline);
-
-  await waSendList(to, "Elegí una opción para continuar:", [
-    { id: "opt_cotizar",  title: "🛒 Quiero comprar" },
-    { id: "opt_catalogo", title: "🧾 Ver catálogo" },
-    { id: "opt_producto", title: "🔎 Saber de un producto" },
-    { id: "opt_ubicacion",title: "📍 Ubicación" },
-    { id: "opt_horarios", title: "🕒 Horarios" },
-    { id: "opt_asesor",   title: "👩‍💼 Hablar con un asesor" },
-    { id: "opt_dudas",    title: "🧠 IA interactiva" },
-  ]);
+function getCatalogUrl(tipoEspacio = "") {
+  const key = tipoEspacio.toLowerCase();
+  if (key.includes("oficina"))
+    return config.CATALOG_URL_OFICINA || config.CATALOG_URL;
+  if (key.includes("hogar"))
+    return config.CATALOG_URL_HOGAR || config.CATALOG_URL;
+  if (key.includes("local"))
+    return config.CATALOG_URL_LOCAL || config.CATALOG_URL;
+  if (key.includes("consultorio") || key.includes("clinica"))
+    return config.CATALOG_URL_CONSULTORIO || config.CATALOG_URL;
+  return config.CATALOG_URL_OTRO || config.CATALOG_URL;
 }
 
 // Descargar media de WhatsApp (para audios/voice)
@@ -81,28 +52,36 @@ async function downloadWaMedia(mediaId) {
   const url = j1?.url;
   if (!url) throw new Error("[WA] empty media url");
 
-  const res = await fetch(url, { headers: { Authorization: `Bearer ${TOKEN}` } });
+  const res = await fetch(url, {
+    headers: { Authorization: `Bearer ${TOKEN}` }
+  });
   if (!res.ok) throw new Error("[WA] download error");
   const buf = Buffer.from(await res.arrayBuffer());
   return buf;
 }
 
-// Enviar tarjeta de contacto al cliente (tipo contacts)
+// Enviar tarjeta de contacto (Hablar con un ejecutivo)
 async function sendContactCard(to) {
-  const name = config.ADVISOR_NAME || "Equipo Comercial";
+  const name = config.ADVISOR_NAME || "Equipo Mobicorp";
   const role = config.ADVISOR_ROLE || "Asesor Comercial";
-  const raw  = (config.ADVISOR_PHONE || "59165900645").replace(/\D/g, "");
-  const phoneIntl = raw.startsWith("+" ) ? raw : (raw.startsWith("591") ? `+${raw}` : `+${raw}`);
+  const raw = (config.ADVISOR_PHONE || "59170000000").replace(/\D/g, "");
+  const phoneIntl = raw.startsWith("+") ? raw : `+${raw}`;
 
   const payload = {
     messaging_product: "whatsapp",
     to,
     type: "contacts",
-    contacts: [{
-      name: { formatted_name: name, first_name: name.split(" ")[0] || name, last_name: name.split(" ").slice(1).join(" ") || "" },
-      org: { company: "NewChem Agroquímicos", title: role },
-      phones: [{ phone: phoneIntl, type: "CELL", wa_id: raw.replace(/^\+/, "") }]
-    }]
+    contacts: [
+      {
+        name: {
+          formatted_name: name,
+          first_name: name.split(" ")[0] || name,
+          last_name: name.split(" ").slice(1).join(" ") || ""
+        },
+        org: { company: "Mobicorp", title: role },
+        phones: [{ phone: phoneIntl, type: "CELL", wa_id: raw.replace(/^\+/, "") }]
+      }
+    ]
   };
 
   const url = `${GRAPH_BASE}/${PHONE_ID}/messages`;
@@ -115,68 +94,129 @@ async function sendContactCard(to) {
     body: JSON.stringify(payload)
   });
   if (!res.ok) {
-    const t = await res.text().catch(()=>"(no body)");
+    const t = await res.text().catch(() => "(no body)");
     throw new Error(`[WA contacts] ${res.status}: ${t}`);
   }
 }
 
+// ======== Mensajes de flujo ========
+
+async function sendB1(to) {
+  await waSendText(
+    to,
+    "👋 ¡Hola! Soy el asistente virtual de *Mobicorp*.\nTe ayudo a cotizar muebles para tu proyecto.\n\nPara empezar, ¿cuál es tu *nombre completo*?"
+  );
+}
+
+async function sendB2(to, nombre) {
+  await waSendList(
+    to,
+    `Gracias, ${nombre} 😊\n¿Nos escribís como…?`,
+    [
+      { id: "tipo_empresa", title: "Empresa" },
+      { id: "tipo_arquitecto", title: "Arquitecto / Diseñador" },
+      { id: "tipo_particular", title: "Particular" }
+    ]
+  );
+}
+
+async function sendB3(to) {
+  await waSendList(
+    to,
+    "¿Desde qué *ciudad / departamento* de Bolivia nos escribís?",
+    [
+      { id: "ciudad_sc", title: "Santa Cruz" },
+      { id: "ciudad_lp", title: "La Paz" },
+      { id: "ciudad_cbba", title: "Cochabamba" },
+      { id: "ciudad_otro", title: "Otro" }
+    ]
+  );
+}
+
+async function sendB5(to) {
+  await waSendList(
+    to,
+    "¿Para qué tipo de *espacio* necesitás los muebles?",
+    [
+      { id: "esp_oficina", title: "Oficina" },
+      { id: "esp_hogar", title: "Hogar" },
+      { id: "esp_local", title: "Local comercial / tienda" },
+      { id: "esp_consultorio", title: "Consultorio / clínica" },
+      { id: "esp_otro", title: "Otro" }
+    ]
+  );
+}
+
+function renderProductosDetalle(items = []) {
+  if (!items.length) return "-";
+  return items
+    .map((it) => {
+      const qty = it.qty || 1;
+      const unit = it.price ? `Bs ${it.price.toFixed(2)}` : "sin precio";
+      const sub = it.price ? ` → Bs ${(it.price * qty).toFixed(2)}` : "";
+      return `• ${it.name} x${qty} (${unit})${sub}`;
+    })
+    .join("\n");
+}
+
 // ======== Router ========
 const router = express.Router();
-const catalog = loadCatalog();
 
 // GET verify
-router.get("/webhook", (req,res)=>{
+router.get("/webhook", (req, res) => {
   const mode = req.query["hub.mode"];
   const token = req.query["hub.verify_token"];
   const challenge = req.query["hub.challenge"];
-  if (mode === "subscribe" && token === config.VERIFY_TOKEN) return res.status(200).send(challenge);
+  if (mode === "subscribe" && token === config.VERIFY_TOKEN) {
+    return res.status(200).send(challenge);
+  }
   return res.sendStatus(403);
 });
 
 // POST messages
-router.post("/webhook", async (req,res)=>{
+router.post("/webhook", async (req, res) => {
   try {
-    const entry  = req.body?.entry?.[0];
+    const entry = req.body?.entry?.[0];
     const change = entry?.changes?.[0];
-    const value  = change?.value;
-    const msg    = value?.messages?.[0];
+    const value = change?.value;
+    const msg = value?.messages?.[0];
     if (!msg) return res.sendStatus(200);
 
     const fromId = msg.from;
-    let s = loadSession(fromId);
-    s.items    = s.items || [];
-    s.mode     = s.mode || "menu";
-    s.history  = s.history || [];
-    s.justBack = s.justBack || false;
+    let s = loadSession(fromId) || {};
+    s.flow = s.flow || "inicio"; // "inicio" | "catalog" | "ia"
+    s.stage = s.stage || null;
+    s.items = s.items || [];
+    s.history = s.history || [];
 
-    // Saludo inicial
-    if (!s.greeted) {
-      s.greeted = true;
-      await sendIntroList(fromId, { returned: false });
-      saveSession(fromId, s);
-      return res.sendStatus(200);
-    }
+    // perfil de WhatsApp para usar como default de nombre
+    const profileName = value?.contacts?.[0]?.profile?.name;
+    if (!s.nombre && profileName) s.nombre = profileName;
 
-    // Normalizar input
     const type = msg.type;
     let textIn = "";
+
     if (type === "text") textIn = (msg.text?.body || "").trim();
     if (type === "interactive") {
       const b = msg.interactive?.button_reply || msg.interactive?.list_reply;
       textIn = b?.id || "";
     }
+
     const nx = normalize(textIn);
 
-    // ===== Volver al menú (por botón o texto) =====
-    if (nx === "go_menu" || /^(volver|menu|menú|inicio)$/.test(nx)) {
-      s.mode = "menu";
-      s.justBack = true;
-      await sendIntroList(fromId, { returned: true });
+    // ===== Comandos rápidos =====
+    if (nx === "reiniciar" || nx === "reset" || nx === "inicio") {
+      s = { flow: "inicio", stage: null, items: [], history: [] };
+      await waSendText(
+        fromId,
+        "🔄 Reinicié la conversación para una nueva cotización."
+      );
+      await sendB1(fromId);
       saveSession(fromId, s);
       return res.sendStatus(200);
     }
 
-    // ===== AUDIO/VOICE -> WHISPER =====
+    // ===== AUDIO/VOICE → Whisper + IA (no afecta el flujo) =====
     if (type === "audio" || type === "voice") {
       const mediaId = msg.audio?.id || msg.voice?.id;
       try {
@@ -184,349 +224,549 @@ router.post("/webhook", async (req,res)=>{
         const { text } = await transcribeAudio(buf, "wa_audio.ogg");
         if (text) {
           s.history.push({ role: "user", content: text });
-          const out = await chatIA(text, s.history);
+          const out = await chatIA(
+            text,
+            s.history,
+            "El usuario envía su consulta por audio mientras está cotizando muebles con Mobicorp."
+          );
           s.history.push({ role: "assistant", content: out });
-          await waSendText(fromId, `🗣️ *Transcripción:* ${text}\n\n${out}`);
+          await waSendText(
+            fromId,
+            `🗣️ *Transcripción de tu audio:*\n"${text}"\n\n${out}`
+          );
         } else {
-          await waSendText(fromId, "No pude oír claramente el audio. ¿Podés repetir o escribirlo?");
+          await waSendText(
+            fromId,
+            "No pude oír claramente el audio. ¿Podés repetir o escribirme tu consulta?"
+          );
         }
       } catch (e) {
         console.error("[WHISPER] err", e);
-        await waSendText(fromId, "No pude procesar tu audio. Intentá de nuevo o escribime tu consulta.");
+        await waSendText(
+          fromId,
+          "No pude procesar tu audio. Intentá de nuevo o escribime tu consulta."
+        );
       }
-      await sendBackList(fromId);
       saveSession(fromId, s);
       return res.sendStatus(200);
     }
 
-    // ===== Manejo de selección del menú =====
-    if (nx.startsWith("opt_")) {
-      s.mode = ({
-        "opt_cotizar":  "cotizar",
-        "opt_catalogo": "catalogo",
-        "opt_producto": "producto",
-        "opt_ubicacion":"ubicacion",
-        "opt_horarios": "horarios",
-        "opt_asesor":   "asesor",
-        "opt_dudas":    "dudas"
-      })[nx] || "menu";
-      textIn = "";
+    // ===== Detectar carrito pegado desde la web (entrada C1) =====
+    let parsedCart = null;
+    if (type === "text" && textIn) {
+      parsedCart = parseCartFromText(textIn);
     }
 
-    // ===== Flujos =====
-    switch (s.mode) {
+    if (parsedCart && parsedCart.items.length) {
+      // Arranca flujo "Desde catálogo web"
+      s.flow = "catalog";
+      s.stage = "C1";
+      s.items = parsedCart.items;
+      s.subtotalPreliminar = parsedCart.subtotal;
+      s.rawCartText = textIn;
 
-      // --- Ubicación ---
-      case "ubicacion": {
-        if (config.STORE_LAT && config.STORE_LNG) {
-          await waSendText(fromId, `📍 Estamos aquí: https://www.google.com/maps?q=${config.STORE_LAT},${config.STORE_LNG}\nTe esperamos 🙌`);
-        } else {
-          await waSendText(fromId, "📍 Ubicación próximamente. Si querés, pedime al asesor y te pasa la dirección exacta.");
-        }
-        await sendBackList(fromId, "¿Algo más?");
-        break;
+      const nombre = s.nombre || "allí";
+      await waSendText(
+        fromId,
+        `👋 ¡Hola ${nombre}!\nRecibí tu selección desde el *catálogo web de Mobicorp* 👌\n\nEsto es lo que elegiste:\n${renderProductosDetalle(
+          s.items
+        )}\n\n¿Está correcto tu listado?`
+      );
+      await waSendList(fromId, "Confirmá tu listado:", [
+        { id: "cart_ok", title: "Sí, está correcto" },
+        { id: "cart_fix", title: "Quiero corregir algo" }
+      ]);
+
+      saveSession(fromId, s);
+      return res.sendStatus(200);
+    }
+
+    // A partir de acá trabajamos por flujo/etapa
+    // ================= FLUJO 1: INICIO WHATSAPP (B1–B6) =================
+    if (s.flow === "inicio") {
+      // Si no hay etapa, empezamos en B1
+      if (!s.stage) {
+        s.stage = "B1";
+        await sendB1(fromId);
+        saveSession(fromId, s);
+        return res.sendStatus(200);
       }
 
-      // --- Horarios ---
-      case "horarios": {
-        await waSendList(fromId, "Elegí sucursal para ver horarios:", [
-          { id: "hor_main", title: "🏬 Oficina Central" },
-          { id: "hor_depo", title: "🏗️ Depósito" },
-          { id: "go_menu",  title: "⬅️ Volver al menú" }
-        ]);
-        s.mode = "horarios_wait";
-        break;
-      }
-      case "horarios_wait": {
-        if (nx === "hor_main") {
-          await waSendText(fromId, "🏬 *Casa Matriz*\nLun–Vie 8:30–12:30 / 14:30–18:30\nSáb 8:30–12:30");
-        } else if (nx === "hor_depo") {
-          await waSendText(fromId, "🏗️ *Depósito*\nLun–Vie 8:30–17:00");
-        } else if (nx === "go_menu") {
-          s.mode = "menu";
-          s.justBack = true;
-          await sendIntroList(fromId, { returned: true });
-          break;
-        } else if (textIn) {
-          await waSendText(fromId, "Elegí una opción de la lista por favor.");
-        }
-        if (s.mode !== "menu") await sendBackList(fromId);
-        break;
-      }
-
-      // --- Catálogo (URL) ---
-      case "catalogo": {
-        const url = config.CATALOG_URL || "Catálogo no disponible por ahora.";
-        await waSendText(fromId, `🧾 *Catálogo*: ${url}\nSi querés, decime el producto y te asesoro.`);
-        await sendBackList(fromId, "¿Querés volver al menú?");
-        break;
-      }
-
-      // --- Asesor (tarjeta de contacto) ---
-      case "asesor": {
-        await waSendText(fromId, "👩‍💼 Te conecto con un asesor de nuestro equipo:");
-        try {
-          await sendContactCard(fromId);
-        } catch (e) {
-          console.error("[CONTACT] error", e);
-          // fallback
-          const raw = (config.ADVISOR_PHONE || "59165900645").replace(/\D/g, "");
-          await waSendText(fromId, `Si te aparece el contacto, guardalo. Si no, escribí a: https://wa.me/${raw}`);
-        }
-        await sendBackList(fromId, "¿Volvemos al menú?");
-        break;
-      }
-
-      // --- IA interactiva ---
-      case "dudas": {
+      // B1: pedir nombre
+      if (s.stage === "B1") {
         if (!textIn) {
-          await waSendText(fromId, "🧠 Contame tu consulta (texto o audio). Te oriento con cultivos, plagas, productos y logística. No invento precios.");
-          await sendBackList(fromId);
-          break;
+          await waSendText(
+            fromId,
+            "Para empezar, decime tu *nombre completo* por favor 🙂"
+          );
+        } else {
+          s.nombre = textIn.trim();
+          s.stage = "B2";
+          await sendB2(fromId, s.nombre);
         }
-        s.history.push({ role: "user", content: textIn });
-        const out = await chatIA(textIn, s.history);
-        s.history.push({ role: "assistant", content: out });
-        await waSendText(fromId, out);
-        await sendBackList(fromId);
-        break;
+        saveSession(fromId, s);
+        return res.sendStatus(200);
       }
 
-      // --- Saber de un producto (envía imagen + CTA) ---
-      case "producto": {
-        // Si el usuario aún no escribió, ofrecé selección directa
-        if (!textIn || nx === "producto") {
-          await waSendList(fromId, "Decime el producto o elegí uno:", [
-            { id: "pick_drier",   title: "Drier" },
-            { id: "pick_glisato", title: "Glisato" },
-            { id: "pick_layer",   title: "Layer" },
-            { id: "pick_trench",  title: "Trench" },
-            { id: "go_menu",      title: "⬅️ Volver al menú" }
-          ]);
-          s.mode = "producto_wait";
-          break;
+      // B2: tipo de cliente
+      if (s.stage === "B2") {
+        if (!textIn) {
+          await sendB2(fromId, s.nombre || "allí");
+          saveSession(fromId, s);
+          return res.sendStatus(200);
         }
-        // Si escribió algo, seguimos mismo handler que producto_wait
-        s.mode = "producto_wait";
-        // No break → cae al siguiente case
+
+        if (nx === "tipo_empresa" || textIn.toLowerCase().includes("empresa")) {
+          s.tipoCliente = "Empresa";
+        } else if (
+          nx === "tipo_arquitecto" ||
+          textIn.toLowerCase().includes("arquitect")
+        ) {
+          s.tipoCliente = "Arquitecto / Diseñador";
+        } else if (nx === "tipo_particular" ||
+          textIn.toLowerCase().includes("particular")
+        ) {
+          s.tipoCliente = "Particular";
+        } else {
+          await waSendText(
+            fromId,
+            "Elegí una opción de la lista: Empresa, Arquitecto / Diseñador o Particular."
+          );
+          await sendB2(fromId, s.nombre || "allí");
+          saveSession(fromId, s);
+          return res.sendStatus(200);
+        }
+
+        s.stage = "B3";
+        await sendB3(fromId);
+        saveSession(fromId, s);
+        return res.sendStatus(200);
       }
 
-      case "producto_wait": {
-        // Resolver producto desde botón o texto
-        let prod = null;
-        const mapBtn = {
-          "pick_drier": "drier",
-          "pick_glisato": "glisato",
-          "pick_layer": "layer",
-          "pick_trench": "trench"
-        };
-        if (mapBtn[nx]) {
-          prod = KNOWN_PRODUCTS.find(p => p.key === mapBtn[nx]);
-        } else if (nx) {
-          prod = KNOWN_PRODUCTS.find(p => nx.includes(p.key));
+      // B3: ciudad
+      if (s.stage === "B3") {
+        if (!textIn) {
+          await sendB3(fromId);
+          saveSession(fromId, s);
+          return res.sendStatus(200);
         }
 
-        if (nx === "go_menu") {
-          s.mode = "menu";
-          s.justBack = true;
-          await sendIntroList(fromId, { returned: true });
-          break;
+        if (nx === "ciudad_sc" || textIn.toLowerCase().includes("santa cruz")) {
+          s.ciudad = "Santa Cruz";
+        } else if (nx === "ciudad_lp" || textIn.toLowerCase().includes("la paz")) {
+          s.ciudad = "La Paz";
+        } else if (
+          nx === "ciudad_cbba" ||
+          textIn.toLowerCase().includes("cochabamba")
+        ) {
+          s.ciudad = "Cochabamba";
+        } else {
+          s.ciudad = textIn.trim();
         }
 
-        if (prod) {
-          // Enviar imagen local desde ./images/*
-          try {
-            const filePath = `./images/${prod.img}`;
-            const mediaId  = await waUploadMediaFromFile(filePath, "image/jpeg", prod.img);
-            if (mediaId) {
-              await waSendImage(fromId, mediaId,
-                `✅ *${prod.name}* — Calidad y desempeño comprobado.\n¿Querés avanzar con una cotización?`);
-            }
-          } catch (e) {
-            console.error("[IMG UPLOAD] error", e);
-          }
-
-          // CTA posterior
-          await waSendList(fromId, `¿Qué hacemos con *${prod.name}*?`, [
-            { id: `prod_quote_${prod.key}`, title: "🧾 Cotizar este" },
-            { id: "prod_other",             title: "🔎 Ver otro producto" },
-            { id: "go_menu",                title: "⬅️ Volver al menú" }
-          ]);
-          s.mode = "producto_action";
-          s.lastProduct = prod.name;
-          break;
-        }
-
-        // No reconocido
-        await waSendText(fromId, "Ese producto no lo tengo registrado. Probá con Drier, Glisato, Layer o Trench.");
-        await sendBackList(fromId);
-        break;
+        s.stage = "B4";
+        await waSendText(
+          fromId,
+          `¿En qué *zona o barrio* de ${s.ciudad} estás?`
+        );
+        saveSession(fromId, s);
+        return res.sendStatus(200);
       }
 
-      case "producto_action": {
-        if (nx === "prod_other") {
-          s.mode = "producto";
-          // relanza el picker
-          await waSendList(fromId, "Elegí un producto:", [
-            { id: "pick_drier",   title: "Drier" },
-            { id: "pick_glisato", title: "Glisato" },
-            { id: "pick_layer",   title: "Layer" },
-            { id: "pick_trench",  title: "Trench" },
-            { id: "go_menu",      title: "⬅️ Volver al menú" }
-          ]);
-          break;
+      // B4: zona/barrio
+      if (s.stage === "B4") {
+        if (!textIn) {
+          await waSendText(
+            fromId,
+            `Decime en qué *zona o barrio* de ${s.ciudad} estás.`
+          );
+        } else {
+          s.zona = textIn.trim();
+          s.stage = "B5";
+          await sendB5(fromId);
         }
-        if (nx === "go_menu") {
-          s.mode = "menu";
-          s.justBack = true;
-          await sendIntroList(fromId, { returned: true });
-          break;
-        }
-        // prod_quote_*
-        const m = nx.match(/^prod_quote_(.+)$/);
-        if (m) {
-          const key = m[1];
-          const prod = KNOWN_PRODUCTS.find(p => p.key === key);
-          if (prod) {
-            // agregamos item base a la cotización
-            s.items.push({ name: prod.name, qty: 1, price: null });
-            await waSendText(fromId, `Perfecto, añadí *${prod.name}* a tu cotización (cant. 1). Podés ajustar luego.`);
-            // Ofrezco continuar al flujo de cotización
-            await waSendList(fromId, "¿Continuamos para generar tu PDF?", [
-              { id: "opt_cotizar", title: "🧾 Generar cotización" },
-              { id: "go_menu",     title: "⬅️ Volver al menú" }
-            ]);
-            s.mode = "menu"; // dejamos modo en menú; el botón decide
-          } else {
-            await waSendText(fromId, "No pude preparar ese producto. Probemos de nuevo.");
-            await sendBackList(fromId);
-          }
-          break;
-        }
-        // si cae acá, recordá botón
-        await sendBackList(fromId);
-        break;
+        saveSession(fromId, s);
+        return res.sendStatus(200);
       }
 
-      // --- Cotizar (flujo guiado) ---
-      case "cotizar": {
-        s.stage = s.stage || "ask_name";
-
-        if (s.stage === "ask_name") {
-          if (!textIn) {
-            await waSendText(fromId, "🧾 Arranquemos tu cotización. ¿Cuál es tu *nombre completo*?");
-            await sendBackList(fromId);
-            break;
-          }
-          s.name = textIn.trim();
-          s.stage = "ask_cultivo";
+      // B5: tipo de espacio
+      if (s.stage === "B5") {
+        if (!textIn) {
+          await sendB5(fromId);
+          saveSession(fromId, s);
+          return res.sendStatus(200);
         }
 
-        if (s.stage === "ask_cultivo") {
-          if (!textIn || /nombre completo/i.test(textIn)) {
-            await waSendList(fromId, "¿Para qué cultivo es?", [
-              { id: "c_soya",  title: "Soya" },
-              { id: "c_maiz",  title: "Maíz" },
-              { id: "c_trigo", title: "Trigo" },
-              { id: "go_menu", title: "⬅️ Volver al menú" }
-            ]);
-            break;
-          }
-          if (nx === "c_soya") s.cultivo = "Soya";
-          else if (nx === "c_maiz") s.cultivo = "Maíz";
-          else if (nx === "c_trigo") s.cultivo = "Trigo";
-          else s.cultivo = textIn.trim();
-          s.stage = "ask_hect";
+        if (nx === "esp_oficina" || textIn.toLowerCase().includes("oficina")) {
+          s.tipoEspacio = "Oficina";
+        } else if (nx === "esp_hogar" || textIn.toLowerCase().includes("hogar")) {
+          s.tipoEspacio = "Hogar";
+        } else if (nx === "esp_local" || textIn.toLowerCase().includes("local")) {
+          s.tipoEspacio = "Local comercial / tienda";
+        } else if (
+          nx === "esp_consultorio" ||
+          textIn.toLowerCase().includes("consultorio") ||
+          textIn.toLowerCase().includes("clinica") ||
+          textIn.toLowerCase().includes("clínica")
+        ) {
+          s.tipoEspacio = "Consultorio / clínica";
+        } else {
+          s.tipoEspacio = textIn.trim();
         }
 
-        if (s.stage === "ask_hect") {
-          await waSendText(fromId, "¿Cuántas *hectáreas* vas a trabajar? (escribí el número)");
-          s.stage = "wait_hect";
-          await sendBackList(fromId);
-          break;
-        }
+        s.stage = "B6";
+        const url = getCatalogUrl(s.tipoEspacio);
+        const msgCatalogo =
+          url && url.startsWith("http")
+            ? `Te comparto nuestro catálogo web para *${s.tipoEspacio}*:\n${url}\n\nAhí podés ver modelos, precios y elegir cantidades.\n\nCuando termines tu selección, en la web tocá el botón *“Enviar a WhatsApp / Solicitar cotización”* y seguimos por acá con tu cotización automática ✅`
+            : `Perfecto, ${s.nombre}.\n\nTe comparto nuestro catálogo web para *${s.tipoEspacio}* (pedí el link a tu ejecutivo si aún no lo tenés).\n\nCuando termines tu selección, tocá el botón *“Enviar a WhatsApp / Solicitar cotización”* y seguimos por acá con tu cotización automática ✅`;
 
-        if (s.stage === "wait_hect") {
-          const n = Number((textIn || "").replace(/[^\d]/g, ""));
-          if (!Number.isFinite(n) || n <= 0) {
-            await waSendText(fromId, "Pasame un número válido de hectáreas, por favor.");
-            await sendBackList(fromId);
-            break;
-          }
-          s.hectareas = n;
-          s.stage = "ask_camp";
-        }
-
-        if (s.stage === "ask_camp") {
-          await waSendList(fromId, "¿Para qué campaña?", [
-            { id: "camp_verano",   title: "Verano" },
-            { id: "camp_invierno", title: "Invierno" },
-            { id: "go_menu",       title: "⬅️ Volver al menú" }
-          ]);
-          s.stage = "wait_camp";
-          break;
-        }
-
-        if (s.stage === "wait_camp") {
-          if (nx === "camp_verano") s.campana = "Verano";
-          else if (nx === "camp_invierno") s.campana = "Invierno";
-          else { await waSendText(fromId, "Elegí una opción de campaña."); await sendBackList(fromId); break; }
-          s.stage = "summary";
-        }
-
-        if (s.stage === "summary") {
-          await waSendText(fromId,
-            `✨ *Resumen para tu cotización*\n` +
-            `• Cliente: ${s.name}\n` +
-            `• Cultivo: ${s.cultivo}\n` +
-            `• Hectáreas: ${s.hectareas}\n` +
-            `• Campaña: ${s.campana}\n` +
-            (s.items?.length ? `• Ítems: ${s.items.length}\n` : "") +
-            `\nVoy a generar tu PDF ahora mismo.`);
-
-          const { path: pdfPath, filename } = await buildQuote({
-            name: s.name,
-            cultivo: s.cultivo,
-            hectareas: s.hectareas,
-            campana: s.campana,
-            departamento: s.departamento || "",
-            subzona: s.subzona || "",
-            items: s.items || []
-          }, fromId);
-
-          const mediaId = await waUploadMediaFromFile(pdfPath, "application/pdf", filename);
-          if (mediaId) await waSendDocument(fromId, mediaId, filename, "🧾 Tu cotización está lista.");
-          await sendBackList(fromId, "¿Querés hacer otra gestión?");
-          s.stage = null;
-          break;
-        }
-
-        break;
+        await waSendText(fromId, msgCatalogo);
+        s.stage = "B6_WAIT_WEB"; // esperamos carrito desde la web
+        saveSession(fromId, s);
+        return res.sendStatus(200);
       }
 
-      // --- Default / texto suelto ---
-      default: {
-        // atajos por texto
-        if (/^cotizar$/.test(nx)) s.mode = "cotizar";
-        else if (/^catalogo$/.test(nx)) s.mode = "catalogo";
-        else if (/^producto$/.test(nx)) s.mode = "producto";
-        else if (/^ubicacion$/.test(nx)) s.mode = "ubicacion";
-        else if (/^horarios$/.test(nx)) s.mode = "horarios";
-        else if (/^asesor$/.test(nx)) s.mode = "asesor";
-        else if (/^dudas?$/.test(nx)) s.mode = "dudas";
-        else {
-          await waSendText(fromId, "No te entendí bien. Mirá estas opciones y elegí una para seguir:\n\n" + humanMenu());
-          await sendBackList(fromId);
-        }
-        break;
+      // B6_WAIT_WEB: básicamente esperamos que llegue el carrito pegado
+      if (s.stage === "B6_WAIT_WEB") {
+        await waSendText(
+          fromId,
+          "Cuando termines en el catálogo, tocá *“Enviar a WhatsApp / Solicitar cotización”* y acá voy a leer automáticamente tu selección 🙌"
+        );
+        saveSession(fromId, s);
+        return res.sendStatus(200);
       }
     }
 
+    // ================= FLUJO 2: DESDE CATÁLOGO WEB (C1–C5) =================
+    if (s.flow === "catalog") {
+      // C1 ya se maneja cuando detectamos el carrito (arriba)
+      if (s.stage === "C1") {
+        // esperando respuesta a "¿Está correcto tu listado?"
+        if (nx === "cart_ok") {
+          s.stage = "C2";
+          await waSendText(
+            fromId,
+            `Para confirmar, tengo estos datos:\nCiudad: ${s.ciudad || "-"}\nZona/barrio: ${s.zona || "-"}\n\n¿Es correcto?`
+          );
+          await waSendList(fromId, "Confirmá tu ubicación:", [
+            { id: "loc_ok", title: "Sí, es correcto" },
+            { id: "loc_change", title: "No, cambiar ubicación" }
+          ]);
+        } else if (nx === "cart_fix") {
+          s.stage = "C1_WAIT_NEW_CART";
+          await waSendText(
+            fromId,
+            "Perfecto, podés corregir tu selección en el catálogo y volver a tocar *“Enviar a WhatsApp”*, o pegar aquí un nuevo listado con los productos que querés."
+          );
+        } else if (textIn) {
+          await waSendText(
+            fromId,
+            "Tocá una de las opciones: *Sí, está correcto* o *Quiero corregir algo*."
+          );
+        }
+        saveSession(fromId, s);
+        return res.sendStatus(200);
+      }
+
+      if (s.stage === "C1_WAIT_NEW_CART") {
+        // volver a intentar parsear carrito
+        if (type === "text" && textIn) {
+          const again = parseCartFromText(textIn);
+          if (again && again.items.length) {
+            s.items = again.items;
+            s.subtotalPreliminar = again.subtotal;
+            s.rawCartText = textIn;
+            s.stage = "C1";
+            await waSendText(
+              fromId,
+              `Esta es tu selección actualizada:\n${renderProductosDetalle(
+                s.items
+              )}\n\n¿Está correcto tu listado?`
+            );
+            await waSendList(fromId, "Confirmá tu listado:", [
+              { id: "cart_ok", title: "Sí, está correcto" },
+              { id: "cart_fix", title: "Quiero corregir algo" }
+            ]);
+          } else {
+            await waSendText(
+              fromId,
+              "No pude leer productos en ese mensaje. Asegurate de pegar el listado con viñetas (• / *) y cantidades."
+            );
+          }
+        }
+        saveSession(fromId, s);
+        return res.sendStatus(200);
+      }
+
+      // C2: confirmar ubicación
+      if (s.stage === "C2") {
+        if (nx === "loc_ok") {
+          s.stage = "C3";
+        } else if (nx === "loc_change") {
+          s.stage = "C2_CHANGE_CITY";
+          await waSendText(
+            fromId,
+            "Listo, actualicemos tu ubicación.\n\n¿Desde qué *ciudad / departamento* de Bolivia nos escribís?"
+          );
+          saveSession(fromId, s);
+          return res.sendStatus(200);
+        } else if (textIn) {
+          await waSendText(
+            fromId,
+            "Elegí una opción: *Sí, es correcto* o *No, cambiar ubicación*."
+          );
+          saveSession(fromId, s);
+          return res.sendStatus(200);
+        }
+      }
+
+      if (s.stage === "C2_CHANGE_CITY") {
+        if (!textIn) {
+          await waSendText(
+            fromId,
+            "Decime desde qué *ciudad / departamento* nos escribís."
+          );
+        } else {
+          s.ciudad = textIn.trim();
+          s.stage = "C2_CHANGE_ZONE";
+          await waSendText(
+            fromId,
+            `¿En qué *zona o barrio* de ${s.ciudad} estás?`
+          );
+        }
+        saveSession(fromId, s);
+        return res.sendStatus(200);
+      }
+
+      if (s.stage === "C2_CHANGE_ZONE") {
+        if (!textIn) {
+          await waSendText(
+            fromId,
+            `Decime en qué *zona o barrio* de ${s.ciudad} estás.`
+          );
+        } else {
+          s.zona = textIn.trim();
+          s.stage = "C3";
+        }
+        saveSession(fromId, s);
+        if (s.stage !== "C3") return res.sendStatus(200);
+      }
+
+      // C3: tipo de servicio
+      if (s.stage === "C3") {
+        await waSendList(
+          fromId,
+          "¿Cómo querés que armemos la propuesta?",
+          [
+            { id: "srv_retiro", title: "Solo muebles (retirás en tienda)" },
+            { id: "srv_entrega", title: "Muebles + entrega" },
+            {
+              id: "srv_entrega_armado",
+              title: "Muebles + entrega + armado"
+            }
+          ]
+        );
+        s.stage = "C3_WAIT";
+        saveSession(fromId, s);
+        return res.sendStatus(200);
+      }
+
+      if (s.stage === "C3_WAIT") {
+        if (nx === "srv_retiro") {
+          s.tipoServicio = "Solo muebles (retirás en tienda)";
+        } else if (nx === "srv_entrega") {
+          s.tipoServicio = "Muebles + entrega";
+        } else if (nx === "srv_entrega_armado") {
+          s.tipoServicio = "Muebles + entrega + armado";
+        } else if (textIn) {
+          await waSendText(
+            fromId,
+            "Elegí una de las opciones de la lista para el tipo de servicio."
+          );
+          saveSession(fromId, s);
+          return res.sendStatus(200);
+        } else {
+          saveSession(fromId, s);
+          return res.sendStatus(200);
+        }
+
+        // pasar a C4
+        s.stage = "C4";
+        const total = s.subtotalPreliminar || s.items.reduce(
+          (acc, it) => acc + ((it.price || 0) * (it.qty || 1)),
+          0
+        );
+        s.totalCalculado = total;
+
+        const detalle = renderProductosDetalle(s.items);
+        const nombre = s.nombre || "Cliente";
+
+        const texto = [
+          `Perfecto, ${nombre}.`,
+          "Con la información que nos diste, esta es tu *cotización preliminar*:",
+          "",
+          "COTIZACIÓN MOBICORP",
+          `Cliente: ${nombre} – ${s.tipoCliente || "-"}`,
+          `Ciudad / zona: ${s.ciudad || "-"} – ${s.zona || "-"}`,
+          `Espacio: ${s.tipoEspacio || "-"}`,
+          "",
+          "Productos:",
+          detalle,
+          "",
+          `Servicio: ${s.tipoServicio || "-"}`,
+          "",
+          `TOTAL APROXIMADO: ${humanTotal(total)}`,
+          "(Referencial, sujeto a stock y verificación.)",
+          "",
+          "¿Generamos la *cotización formal en PDF* con estos datos?"
+        ].join("\n");
+
+        await waSendText(fromId, texto);
+        await waSendList(fromId, "Elegí una opción:", [
+          { id: "pdf_yes", title: "Sí, generar PDF" },
+          { id: "pdf_adjust", title: "Ajustar antes" }
+        ]);
+
+        saveSession(fromId, s);
+        return res.sendStatus(200);
+      }
+
+      // C4: decidir si generar PDF
+      if (s.stage === "C4") {
+        if (nx === "pdf_yes") {
+          s.stage = "C5";
+        } else if (nx === "pdf_adjust") {
+          s.stage = "C1_WAIT_NEW_CART";
+          await waSendText(
+            fromId,
+            "Genial, ajustemos antes de generar el PDF.\nPodés reenviar tu selección corregida desde la web o pegar aquí un nuevo listado con productos y cantidades."
+          );
+          saveSession(fromId, s);
+          return res.sendStatus(200);
+        } else if (textIn) {
+          await waSendText(
+            fromId,
+            "Elegí una opción: *Sí, generar PDF* o *Ajustar antes*."
+          );
+          saveSession(fromId, s);
+          return res.sendStatus(200);
+        }
+      }
+
+      // C5: generar y enviar PDF + opciones finales
+      if (s.stage === "C5") {
+        try {
+          const { path: pdfPath, filename } = await buildQuote(s, fromId);
+          const mediaId = await waUploadMediaFromFile(
+            pdfPath,
+            "application/pdf",
+            filename
+          );
+          if (mediaId) {
+            await waSendDocument(
+              fromId,
+              mediaId,
+              filename,
+              "🧾 Tu cotización formal de Mobicorp está lista."
+            );
+          }
+          await waSendText(
+            fromId,
+            `Listo 🙌\nTe enviamos la *cotización formal de Mobicorp en PDF*.\n\nCOT MOBICORP – ${s.nombre || "cliente"} enviada.`
+          );
+          await waSendList(fromId, "¿Cómo seguimos?", [
+            { id: "alt_ver", title: "Ver alternativas" },
+            { id: "alt_ejecutivo", title: "Hablar con un ejecutivo" }
+          ]);
+          s.stage = "C5_AFTER";
+        } catch (e) {
+          console.error("[PDF] error", e);
+          await waSendText(
+            fromId,
+            "No pude generar el PDF ahora mismo. ¿Te parece si lo intento nuevamente o preferís que te contacte un ejecutivo?"
+          );
+        }
+        saveSession(fromId, s);
+        return res.sendStatus(200);
+      }
+
+      if (s.stage === "C5_AFTER") {
+        if (nx === "alt_ver") {
+          s.flow = "ia";
+          s.stage = "IA_ALTERNATIVAS";
+          await waSendText(
+            fromId,
+            "Contame qué parte querés optimizar (por ejemplo: sillas, escritorios, presupuesto máximo, estilo) y nuestra IA te sugiere *alternativas más económicas o más premium*."
+          );
+        } else if (nx === "alt_ejecutivo") {
+          await waSendText(
+            fromId,
+            "Te conecto con alguien de nuestro equipo para que terminen la propuesta juntos 🙌"
+          );
+          try {
+            await sendContactCard(fromId);
+          } catch (e) {
+            console.error("[CONTACT] error", e);
+          }
+        } else if (textIn) {
+          await waSendText(
+            fromId,
+            "Elegí *Ver alternativas* o *Hablar con un ejecutivo* desde la lista."
+          );
+        }
+        saveSession(fromId, s);
+        return res.sendStatus(200);
+      }
+    }
+
+    // ================= FLUJO 3: IA (alternativas o dudas sueltas) =================
+    if (s.flow === "ia") {
+      if (s.stage === "IA_ALTERNATIVAS") {
+        if (!textIn) {
+          await waSendText(
+            fromId,
+            "Decime qué querés ajustar (menos presupuesto, más diseño, otro tipo de sillas, etc.)."
+          );
+        } else {
+          const context = [
+            `Cliente: ${s.nombre || "-"}`,
+            `Tipo cliente: ${s.tipoCliente || "-"}`,
+            `Ciudad / zona: ${s.ciudad || "-"} – ${s.zona || "-"}`,
+            `Espacio: ${s.tipoEspacio || "-"}`,
+            `Servicio: ${s.tipoServicio || "-"}`,
+            `Listado actual de productos:\n${renderProductosDetalle(s.items)}`
+          ].join("\n");
+
+          s.history.push({ role: "user", content: textIn });
+          const out = await chatIA(
+            textIn,
+            s.history,
+            `El usuario ya tiene una cotización de Mobicorp con los datos siguientes:\n${context}\nDebe proponer alternativas de productos/ configuraciones, pero sin inventar precios exactos.`
+          );
+          s.history.push({ role: "assistant", content: out });
+
+          await waSendText(fromId, out);
+          await waSendText(
+            fromId,
+            "Si alguna de las alternativas te convence, escribime qué cambio querés y lo ajustamos en tu cotización 😊"
+          );
+        }
+        saveSession(fromId, s);
+        return res.sendStatus(200);
+      }
+    }
+
+    // ===== Si nada matchea, contención básica =====
+    await waSendText(
+      fromId,
+      "Te ayudo a cotizar muebles para tu proyecto. Podés escribir *reiniciar* para empezar una nueva cotización o reenviar tu selección desde el catálogo web."
+    );
     saveSession(fromId, s);
-    res.sendStatus(200);
+    return res.sendStatus(200);
   } catch (e) {
     console.error("[WEBHOOK] Error:", e);
-    res.sendStatus(200);
+    return res.sendStatus(200);
   }
 });
 
