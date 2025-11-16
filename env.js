@@ -45,5 +45,9 @@ export const config = {
   SHEETS_TAB3_NAME: process.env.SHEETS_TAB3_NAME || "PRECIOS",
   SHEETS_TAB4_NAME: process.env.SHEETS_TAB4_NAME || "HIST",
 
+  // 🔗 Django backend (para enviar leads del bot)
+  DJANGO_WA_URL: process.env.DJANGO_WA_URL,          // ej: https://fa9e157e59cc.ngrok-free.app/api/wa/lead/
+  DJANGO_WA_API_KEY: process.env.DJANGO_WA_API_KEY,  // misma clave que valida Django
+
   DEBUG_LOGS: process.env.DEBUG_LOGS === "1"
 };
