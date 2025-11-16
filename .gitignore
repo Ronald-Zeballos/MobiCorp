@@ -1,0 +1,33 @@
+# Dependencias
+node_modules/
+
+# Entornos locales
+.env
+.env.*
+!.env.example    # este SÍ se sube como plantilla
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Cachés / builds
+dist/
+build/
+.cache/
+.nyc_output/
+coverage/
+
+# Archivos temporales del sistema / editores
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Datos locales (solo si NO los necesitas en producción)
+data/ai/
+data/tmp/
+data/uploads/
+tmp/
