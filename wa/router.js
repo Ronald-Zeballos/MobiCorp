@@ -56,17 +56,8 @@ function isLikelyName(text = "") {
   return t.length >= 4;
 }
 
-function getCatalogUrl(tipoEspacio = "") {
-  const key = tipoEspacio.toLowerCase();
-  if (key.includes("oficina"))
-    return config.CATALOG_URL_OFICINA || config.CATALOG_URL;
-  if (key.includes("hogar"))
-    return config.CATALOG_URL_HOGAR || config.CATALOG_URL;
-  if (key.includes("local"))
-    return config.CATALOG_URL_LOCAL || config.CATALOG_URL;
-  if (key.includes("consultorio") || key.includes("clinica") || key.includes("clínica"))
-    return config.CATALOG_URL_CONSULTORIO || config.CATALOG_URL;
-  return config.CATALOG_URL_OTRO || config.CATALOG_URL;
+function getCatalogUrl() {
+  return "https://catalogo-mobicorp.netlify.app/catalogo";
 }
 
 async function downloadWaMedia(mediaId) {
@@ -391,6 +382,28 @@ router.post("/webhook", async (req, res) => {
       return res.sendStatus(200);
     }
 
+    if (type === "text" && textIn) {
+      const lower = textIn.toLowerCase();
+      if (
+        lower.includes("ubicacion") ||
+        lower.includes("ubicación") ||
+        lower.includes("direccion") ||
+        lower.includes("dirección") ||
+        lower.includes("donde estan") ||
+        lower.includes("dónde están") ||
+        lower.includes("donde quedan") ||
+        lower.includes("mapa") ||
+        lower.includes("google maps")
+      ) {
+        await waSendText(
+          fromId,
+          "Te comparto la ubicación de Mobicorp en Google Maps:\nhttps://maps.app.goo.gl/Ya8bUjnVAYkEsUiD6?g_st=iw"
+        );
+        saveSession(fromId, s);
+        return res.sendStatus(200);
+      }
+    }
+
     let parsedCart = null;
     if (type === "text" && textIn && s.stage !== "B1") {
       parsedCart = parseCartFromText(textIn);
@@ -466,6 +479,21 @@ router.post("/webhook", async (req, res) => {
           return res.sendStatus(200);
         }
         if (nx === "menu_cotizar") {
+          const hasFullDatos =
+            s.nombre && s.tipoCliente && s.departamento && s.zona && s.tipoEspacio;
+          if (hasFullDatos) {
+            s.stage = "B6_WAIT_WEB";
+            const url = getCatalogUrl();
+            const nombreMenu = s.nombre || "allí";
+            const mensaje =
+              `Perfecto, ${nombreMenu}.\n` +
+              `Te comparto nuestro *catálogo web*:\n${url}\n\n` +
+              "Ahí podés ver modelos, precios y elegir cantidades.\n" +
+              "Cuando termines tu selección, en la web tocá el botón *“Enviar a WhatsApp / Solicitar cotización”* y acá preparo tu cotización automática.";
+            await waSendText(fromId, mensaje);
+            saveSession(fromId, s);
+            return res.sendStatus(200);
+          }
           if (s.nombre) {
             s.stage = "B2";
             await waSendText(
@@ -739,7 +767,7 @@ router.post("/webhook", async (req, res) => {
         }
 
         s.stage = "B6";
-        const url = getCatalogUrl(s.tipoEspacio);
+        const url = getCatalogUrl();
         const msgCatalogo =
           url && url.startsWith("http")
             ? `Perfecto, ${s.nombre}.\nTe comparto nuestro *catálogo web* para espacios de tipo *${s.tipoEspacio}*:\n${url}\n\nAhí podés ver modelos, precios y elegir cantidades.\nCuando termines tu selección, en la web tocá el botón *“Enviar a WhatsApp / Solicitar cotización”* y seguimos por acá con tu cotización automática.`
@@ -768,7 +796,7 @@ router.post("/webhook", async (req, res) => {
         }
 
         s.stage = "B6";
-        const url = getCatalogUrl(s.tipoEspacio);
+        const url = getCatalogUrl();
         const msgCatalogo =
           url && url.startsWith("http")
             ? `Perfecto, ${s.nombre}.\nTe comparto nuestro *catálogo web* para *${s.tipoEspacio}*:\n${url}\n\nAhí podés ver modelos, precios y elegir cantidades.\nCuando termines tu selección, tocá el botón *“Enviar a WhatsApp / Solicitar cotización”* y seguimos por acá con tu cotización automática.`
@@ -893,7 +921,7 @@ router.post("/webhook", async (req, res) => {
         const out = await chatIA(
           textIn,
           s.history,
-          "Eres el asistente virtual de Mobicorp. Responde siempre en español, con un tono profesional, amable y claro. Primero intenta responder de forma útil cualquier duda general del usuario. Luego, si es relevante, recuérdale que puedes ayudarle a:\n1) Consultar sobre productos y soluciones de mobiliario.\n2) Preparar una cotización formal para su proyecto.\nInvita a escribir 'reiniciar' para volver al menú o a pedir explícitamente una cotización. No inventes precios ni promesas comerciales específicas."
+          "Eres el asistente virtual de Mobicorp. Responde siempre en español, con un tono profesional, amable y claro. Primero intenta responder de forma útil cualquier duda general del usuario. Luego, si es relevante, recuérdale que puedes ayudarle a: 1) Consultar sobre productos y soluciones de mobiliario. 2) Preparar una cotización formal para su proyecto. Invita a escribir 'reiniciar' para volver al menú o a pedir explícitamente una cotización. No inventes precios ni promesas comerciales específicas."
         );
         s.history.push({ role: "assistant", content: out });
         await waSendText(fromId, out);
