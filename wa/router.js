@@ -287,7 +287,6 @@ router.post("/webhook", async (req, res) => {
 
     const fromId = msg.from;
     let s = loadSession(fromId) || {};
-    const prevNombre = s.nombre;
     s.flow = s.flow || "inicio";
     s.stage = s.stage || null;
     s.items = s.items || [];
@@ -311,13 +310,22 @@ router.post("/webhook", async (req, res) => {
     const nx = normalize(textIn);
 
     if (nx === "reiniciar" || nx === "reset" || nx === "inicio") {
+      const keepProfile = {
+        nombre: s.nombre || profileName || null,
+        tipoCliente: s.tipoCliente || null,
+        nombreEmpresa: s.nombreEmpresa || null,
+        departamento: s.departamento || null,
+        ciudad: s.ciudad || null,
+        zona: s.zona || null,
+        tipoEspacio: s.tipoEspacio || null
+      };
       s = {
+        ...keepProfile,
         flow: "inicio",
         stage: "MENU_INICIO",
         items: [],
         history: [],
-        flags: {},
-        nombre: prevNombre || s.nombre || null
+        flags: {}
       };
       await waSendText(fromId, "🔄 Reinicié la conversación para una nueva atención.");
       await sendMainMenu(fromId, s.nombre || null);
@@ -839,7 +847,15 @@ router.post("/webhook", async (req, res) => {
 
         if (nx === "ia_cotizar") {
           s.flow = "inicio";
-          if (s.nombre) {
+          if (s.nombre && s.tipoCliente && s.departamento && s.zona && s.tipoEspacio) {
+            s.stage = "B6_WAIT_WEB";
+            const url = getCatalogUrl();
+            const nombreMenu = s.nombre || "allí";
+            await waSendText(
+              fromId,
+              `Genial, ${nombreMenu}. Te comparto directamente nuestro catálogo web:\n${url}\n\nCuando termines tu selección, tocá *“Enviar a WhatsApp / Solicitar cotización”* y preparo tu propuesta.`
+            );
+          } else if (s.nombre) {
             s.stage = "B2";
             await waSendText(
               fromId,
